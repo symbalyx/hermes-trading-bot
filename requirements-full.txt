@@ -1,0 +1,29 @@
+# ═══════════════════════════════════════════════════════════════
+# Hermes Trading Bot — Full Dependencies
+# ═══════════════════════════════════════════════════════════════
+# Install with: pip install -r requirements-full.txt
+# Core deps only: pip install -r requirements.txt
+
+# ─── Core ──────────────────────────────────────────────────────────
+requests>=2.28.0
+numpy>=1.24.0
+pandas>=2.0.0
+
+# ─── API Server ─────────────────────────────────────────────────────
+flask>=3.0.0
+
+# ─── Machine Learning (optional) ───────────────────────────────────
+# scikit-learn>=1.3.0
+
+# ─── Performance ────────────────────────────────────────────────────
+# ta-lib>=0.4.28       # Technical analysis library (C extension)
+# python-binance>=1.0.19  # Official Binance API client
+
+# ─── Notifications ─────────────────────────────────────────────────
+# python-telegram-bot>=20.0
+
+# ─── Database ──────────────────────────────────────────────────────
+# sqlite3 is part of Python stdlib — no install needed
+
+# ─── Web UI ────────────────────────────────────────────────────────
+# No server-side deps needed — uses Chart.js via CDN
