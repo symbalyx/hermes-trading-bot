@@ -39,6 +39,14 @@ except ImportError as e:
     BRAIN_OK = False
     print(f"  ⚠ Module brain.py non chargé: {e}")
 
+# ─── Notifications ──────────────────────────────────────────────────────
+try:
+    from notifier import Notifier, save_config_template
+    NOTIFIER_OK = True
+except ImportError as e:
+    NOTIFIER_OK = False
+    print(f"  ⚠ Module notifier.py non chargé: {e}")
+
 # Exchange connector module
 try:
     from exchange import (
@@ -57,6 +65,14 @@ try:
     ML_OK = True
 except ImportError:
     ML_OK = False
+
+# ─── Learning Engine ──────────────────────────────────────────
+try:
+    from learner import LearningEngine
+    LEARNER_OK = True
+except ImportError as e:
+    LEARNER_OK = False
+    print(f"  ⚠ Module learner.py non chargé: {e}")
 
 # ─── Configuration ───────────────────────────────────────────────
 COINGECKO_BASE = "https://api.coingecko.com/api/v3"
@@ -415,9 +431,10 @@ class CoinResult:
 class CoinAnalyzer:
     """Analyseur individuel — fiable, pas de OHLC fictif"""
 
-    def __init__(self, coin_id: str, df: pd.DataFrame):
+    def __init__(self, coin_id: str, df: pd.DataFrame, learning_engine=None):
         self.coin_id = coin_id
         self.df = df
+        self.learning_engine = learning_engine
 
     def analyze(self) -> Optional[CoinResult]:
         df = self.df
@@ -474,23 +491,29 @@ class CoinAnalyzer:
         atr_pct = (atr_v_val / current * 100) if atr_v_val and current > 0 else 0
         vol_r_val = float(vol_ratio) if pd.notna(vol_ratio) else None
 
-        # ── Score pondere intelligent ──
+        # ── Score pondere intelligent (poids dynamiques du Learning Engine) ──
         score = 0.0
         max_score = 0.0
         reasons = []
         patterns = []
 
-        # 1. RSI (poids 2)
+        # Poids dynamiques depuis le Learning Engine (si disponible)
+        def _w(indicator_name: str, default: float) -> float:
+            if self.learning_engine is not None:
+                return self.learning_engine.get_weight(indicator_name)
+            return default
+
+        # 1. RSI
         if rsi_val is not None:
-            w = 2.0; max_score += w
+            w = _w("rsi", 2.0); max_score += w
             if rsi_val < 30: score += w; reasons.append(f"RSI survente ({rsi_val:.1f})")
             elif rsi_val < 40: score += w * 0.6; reasons.append(f"RSI bas ({rsi_val:.1f})")
             elif rsi_val > 70: score -= w; reasons.append(f"RSI surachat ({rsi_val:.1f})")
             elif rsi_val > 60: score -= w * 0.6; reasons.append(f"RSI haut ({rsi_val:.1f})")
 
-        # 2. MACD (poids 2)
+        # 2. MACD
         if macd_h_val is not None:
-            w = 2.0; max_score += w
+            w = _w("macd", 2.0); max_score += w
             macd_l_val = float(macd_l.iloc[-1]) if pd.notna(macd_l.iloc[-1]) else 0
             macd_s_val = float(macd_s.iloc[-1]) if pd.notna(macd_s.iloc[-1]) else 0
             if macd_l_val > macd_s_val:
@@ -498,17 +521,17 @@ class CoinAnalyzer:
             else:
                 score -= w; reasons.append("MACD baissier")
 
-        # 3. Bollinger (poids 1.5)
+        # 3. Bollinger
         if bb_p_val is not None:
-            w = 1.5; max_score += w
+            w = _w("bollinger", 1.5); max_score += w
             if bb_p_val < 0.05: score += w; reasons.append("Touche bande basse BB (rebond potentiel)")
             elif bb_p_val < 0.2: score += w * 0.5
             elif bb_p_val > 0.95: score -= w; reasons.append("Touche bande haute BB (revers potentiel)")
             elif bb_p_val > 0.8: score -= w * 0.5
 
-        # 4. ADX + Direction (poids 1.5)
+        # 4. ADX + Direction
         if adx_val is not None:
-            w = 1.5; max_score += w
+            w = _w("adx", 1.5); max_score += w
             pdi_val = float(pdi.iloc[-1]) if pd.notna(pdi.iloc[-1]) else 0
             ndi_val = float(ndi.iloc[-1]) if pd.notna(ndi.iloc[-1]) else 0
             if adx_val > 25:
@@ -522,28 +545,28 @@ class CoinAnalyzer:
                 if pdi_val > ndi_val: score += w * 0.3
                 else: score -= w * 0.3
 
-        # 5. Stochastique (poids 1)
+        # 5. Stochastique
         if stoch_k_val is not None:
-            w = 1.0; max_score += w
+            w = _w("stoch", 1.0); max_score += w
             if stoch_k_val < 20: score += w; reasons.append("Stochastique survente")
             elif stoch_k_val > 80: score -= w; reasons.append("Stochastique surachat")
             elif stoch_k_val < 30: score += w * 0.3
             elif stoch_k_val > 70: score -= w * 0.3
 
-        # 6. MFI (poids 1)
+        # 6. MFI
         if mfi_val is not None:
-            w = 1.0; max_score += w
+            w = _w("mfi", 1.0); max_score += w
             if mfi_val < 20: score += w; reasons.append(f"MFI survente ({mfi_val:.0f})")
             elif mfi_val > 80: score -= w; reasons.append(f"MFI surachat ({mfi_val:.0f})")
 
-        # 7. Volume (poids 1.5)
+        # 7. Volume
         if vol_r_val is not None and vol_r_val != float('inf'):
-            w = 1.5; max_score += w
+            w = _w("volume", 1.5); max_score += w
             if vol_r_val > 1.5: score += w * 0.5; reasons.append(f"Volume x{vol_r_val:.1f}")
             elif vol_r_val < 0.3: score -= w * 0.5
 
-        # 8. Tendance reg lin (poids 2)
-        w = 2.0; max_score += w
+        # 8. Tendance reg lin
+        w = _w("trend", 2.0); max_score += w
         if trend_data["trend"] == "bullish":
             score += w * (trend_data["strength"] / 100)
             if trend_data["strength"] > 50:
@@ -553,9 +576,9 @@ class CoinAnalyzer:
             if trend_data["strength"] > 50:
                 reasons.append(f"Tendance baissiere confirmee ({trend_data['strength']:.0f}%)")
 
-        # 9. Divergences (poids 2)
+        # 9. Divergences
         if divergences:
-            w = 2.0; max_score += w
+            w = _w("divergences", 2.0); max_score += w
             for div in divergences:
                 mult = 1.5 if div["strength"] == "strong" else 0.8
                 if div["type"] == "bullish":
@@ -711,12 +734,14 @@ class CoinAnalyzer:
 class MarketAnalyzer:
     """Analyseur multi-coins fiable et rapide"""
 
-    def __init__(self, use_llm=False):
+    def __init__(self, use_llm=False, notifier=None, learning_engine=None):
         self.fetcher = DataFetcher()
         self.llm = self._init_llm() if use_llm else None
         self.use_llm = use_llm
         self.results: list[CoinResult] = []
         self.global_data = {}
+        self.notifier = notifier  # Instance Notifier (optionnelle)
+        self.learning_engine = learning_engine  # Learning Engine (optionnel)
         # Intelligence
         self.brain: Optional['BrainAnalyzer'] = None
         self.sentiment: Optional['SentimentAnalyzer'] = None
@@ -744,7 +769,7 @@ class MarketAnalyzer:
             if df.empty:
                 print(f"pas de donnees"); return None
 
-            analyzer = CoinAnalyzer(coin_id, df)
+            analyzer = CoinAnalyzer(coin_id, df, learning_engine=self.learning_engine)
             result = analyzer.analyze()
             if not result:
                 print(f"calcul impossible"); return None
@@ -952,8 +977,20 @@ class MarketAnalyzer:
                 alerts_text = self.brain.get_alerts().format_report()
                 if alerts_text:
                     print(f"\n{alerts_text}\n")
+                # Envoyer les alertes via notifier si actif
+                if self.notifier and self.notifier.is_enabled():
+                    brain_alerts = self.brain.get_alerts().get_alerts()
+                    if brain_alerts:
+                        log.info("Envoi de %d alerte(s) vers les notifications", len(brain_alerts))
+                        for alert in brain_alerts:
+                            self.notifier.send_alert(
+                                alert_type=alert.get("type", ""),
+                                coin=alert.get("coin", ""),
+                                message=alert.get("message", ""),
+                                score=alert.get("score", 0.0),
+                            )
             except Exception as e:
-                log.debug("Erreur affichage alertes: %s", e)
+                log.debug("Erreur affichage/envoi alertes: %s", e)
 
     def _llm_report(self, top_buys, top_sells, summary):
         print(f"\n  Analyse IA:")
@@ -1265,8 +1302,8 @@ class RiskManager:
 
 # ─── Backtest et Simulation ─────────────────────────────────────
 
-def run_backtest():
-    """Backtest avec metrics completes"""
+def run_backtest(learning_engine=None):
+    """Backtest avec metrics completes et apprentissage optionnel"""
     print("\n  BACKTEST — validation strategie\n")
     f = DataFetcher()
     coins = ["bitcoin", "ethereum", "solana", "cardano", "ripple"]
@@ -1282,7 +1319,7 @@ def run_backtest():
         trades, wins, pnls = 0, 0, []
         for i in range(60, len(close) - 5, 5):  # Tous les 5 jours
             chunk = df.iloc[:i]
-            a = CoinAnalyzer(coin_id, chunk)
+            a = CoinAnalyzer(coin_id, chunk, learning_engine=learning_engine)
             r = a.analyze()
             if r and r.signal == "ACHAT":
                 trades += 1
@@ -1292,6 +1329,17 @@ def run_backtest():
                     ret = (future[0] - entry) / entry * 100
                     pnls.append(ret)
                     if ret > 0: wins += 1
+                    # Enregistrer dans le learning engine
+                    if learning_engine:
+                        regime_label = r.regime.get("regime", "unknown") if r.regime else "unknown"
+                        learning_engine.record_trade(
+                            coin=coin_id,
+                            entry=entry,
+                            exit_price=future[0],
+                            pnl_pct=ret,
+                            regime=regime_label,
+                            score=r.normalized_score,
+                        )
 
         if trades > 0:
             avg_r = np.mean(pnls)
@@ -1316,6 +1364,13 @@ def run_backtest():
     print(f"\n  RESULTATS:")
     for r in all_res:
         print(f"    {r}")
+
+    # Optimiser après le backtest si learning engine actif
+    if learning_engine and learning_engine.get_trade_count() > 0:
+        learning_engine.optimize()
+        print(f"\n  🧠 LEARNING ENGINE — {learning_engine.get_trade_count()} trades enregistrés")
+        print(learning_engine.summary())
+
     print()
 
 
@@ -1411,10 +1466,47 @@ def main():
                         help="Nombre max de positions simultanées")
     parser.add_argument("--create-keys", action="store_true",
                         help="Créer le fichier api_keys.json template")
+    # Notification flags
+    parser.add_argument("--notify", action="store_true",
+                        help="Activer les notifications (Telegram/Email via config)")
+    parser.add_argument("--notify-config", action="store_true",
+                        help="Créer le fichier notifier_config.json template")
+    # Learning flag
+    parser.add_argument("--learn", action="store_true",
+                        help="Activer le moteur d'apprentissage (ajuste poids et seuils)")
     args = parser.parse_args()
 
-    if args.backtest: run_backtest(); return
+    if args.backtest:
+        if args.learn and LEARNER_OK:
+            le_backtest = LearningEngine(data_dir=str(DATA_DIR))
+            print(f"  🧠 Learning Engine actif — {le_backtest.get_trade_count()} trades historiques chargés")
+            run_backtest(learning_engine=le_backtest)
+        else:
+            run_backtest()
+        return
     if args.portfolio > 0: run_portfolio_simulation(args.portfolio); return
+
+    # ─── Notifier setup ──────────────────────────────────────────
+    notifier = None
+    if args.notify_config:
+        if NOTIFIER_OK:
+            path = save_config_template()
+            print(f"  ✓ Template de configuration créé: {path}")
+            print(f"  Éditez ce fichier avec vos identifiants Telegram/Email, puis relancez avec --notify")
+        else:
+            print("  ❌ Module notifier.py introuvable")
+        return
+
+    if args.notify:
+        if NOTIFIER_OK:
+            notifier = Notifier()
+            if notifier.is_enabled():
+                print(f"  🔔 Notifications activées")
+            else:
+                print(f"  ⚠ Notification demandée mais aucun canal configuré")
+                print(f"     Éditez data/notifier_config.json ou utilisez --notify-config")
+        else:
+            print("  ❌ Module notifier.py introuvable")
 
     # ─── Exchange connector setup ────────────────────────────────
     if args.create_keys:
@@ -1456,8 +1548,21 @@ def main():
             print("  Utilisez --paper ou configurez data/api_keys.json")
             sys.exit(1)
 
+    # ─── Learning Engine setup ──────────────────────────────────────
+    learning_engine = None
+    if args.learn:
+        if LEARNER_OK:
+            learning_engine = LearningEngine(data_dir=str(DATA_DIR))
+            print(f"  🧠 Learning Engine actif ({learning_engine.get_trade_count()} trades trackés)")
+            # Optimiser au démarrage si des données existent
+            if learning_engine.get_trade_count() > 0:
+                learning_engine.optimize()
+                print(f"     Poids et seuils optimisés depuis l'historique")
+        else:
+            print(f"  ⚠ --learn demandé mais learner.py non disponible")
+
     coins = TOP_50[:20] if args.coin == "all" else [c.strip() for c in args.coin.split(",")]
-    analyzer = MarketAnalyzer(use_llm=args.llm)
+    analyzer = MarketAnalyzer(use_llm=args.llm, notifier=notifier, learning_engine=learning_engine)
 
     it = 0
     while True:
@@ -1511,6 +1616,45 @@ def main():
                     print(f"     Trades: {ps['total_trades']} | Positions: {len(ps['positions'])}")
             else:
                 print(f"\n  Aucun trade exécuté cette itération")
+
+        # ─── Apprentissage ──────────────────────────────────────────
+        if learning_engine:
+            # Enregistrer les trades réels dans le moteur d'apprentissage
+            if connector and args.trade:
+                try:
+                    # Récupérer les trades récents du gestionnaire de risques
+                    if risk_mgr and risk_mgr.trades:
+                        for tdata in risk_mgr.trades[-5:]:  # 5 derniers trades
+                            # Trouver le coin et régime correspondant
+                            coin_name = "unknown"
+                            regime_label = "unknown"
+                            score_val = 0.0
+                            for r in analyzer.results:
+                                if r and abs(r.price - tdata.get("entry", 0)) / max(r.price, 1) < 0.05:
+                                    coin_name = r.coin_id
+                                    regime_label = r.regime.get("regime", "unknown") if r.regime else "unknown"
+                                    score_val = r.normalized_score
+                                    break
+                            learning_engine.record_trade(
+                                coin=coin_name,
+                                entry=tdata.get("entry", 0),
+                                exit_price=tdata.get("exit", 0),
+                                pnl_pct=tdata.get("pnl_pct", 0),
+                                regime=regime_label,
+                                score=score_val,
+                            )
+                        learning_engine.optimize()
+                except Exception as e:
+                    log.debug("Erreur enregistrement trade learning: %s", e)
+
+            # Afficher le résumé d'apprentissage
+            has_real_trades = learning_engine.get_trade_count() > 0
+            if has_real_trades:
+                print(f"\n  🧠 LEARNING ENGINE — {learning_engine.get_trade_count()} trades | "
+                      f"WR {learning_engine.get_win_rate():.1f}% | "
+                      f"Confiance {learning_engine.get_confidence():.0f}%")
+            else:
+                print(f"\n  🧠 Learning Engine prêt — enregistre les trades quand --trade est actif")
 
         if not args.loop: break
         time.sleep(args.loop * 60)
