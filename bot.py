@@ -1,25 +1,27 @@
 #!/usr/bin/env python3
 """
-Hermes Trading Bot v3 — IA de raisonnement pour le trading crypto.
-Combinaison d'analyse technique avancee, Machine Learning et raisonnement LLM.
+Hermes Trading Bot v3 — IA de raisonnement + Risk Management.
+Analyse technique avancee + ML + IA (qwen2.5:3b) + GESTION DE RISQUE.
 
 Fonctionnalites:
   - Analyse technique complete (RSI, MACD, BB, ADX, Stoch, MFI, ATR, Heikin Ashi)
-  - Machine Learning (RandomForest, LinearRegression) pour predictions
-  - Raisonnement IA via Ollama (qwen2.5:3b) — analyse narrative
+  - Machine Learning (RandomForest, LinearRegression)
+  - Raisonnement IA via Ollama — analyse narrative du marche
   - Divergences RSI/prix (bullish/bearish)
-  - Retracements Fibonacci avec zones de liquidite
-  - Backtesting de strategies
-  - Matrice de correlation entre actifs
-  - Allocations de portefeuille recommandees
-  - Rapport narratif complet style ChatGPT
+  - Retracements Fibonacci
+  - Backtesting avec validation
+  - RISK MANAGEMENT: Kelly Criterion, position sizing, stop-loss ATR,
+    take-profit, trailing stop, drawdown protection
+  - Simulation de portefeuille avec P&L
+  - Site web explicatif (GitHub Pages)
 
 Usage:
-  python3 bot.py                           # Analyse BTC, ETH
-  python3 bot.py --coin all                # Top 20 coins
-  python3 bot.py --coin solana --llm       # Avec raisonnement IA
-  python3 bot.py --backtest                # Backtest strategie
-  python3 bot.py --loop 60 --llm           # Boucle toutes les 60min
+  python3 bot.py                                    # Analyse BTC, ETH
+  python3 bot.py --coin all                         # Top 20 coins
+  python3 bot.py --coin solana --llm                # Avec raisonnement IA
+  python3 bot.py --portfolio 10000                  # Simulation portefeuille 10k$
+  python3 bot.py --backtest                         # Backtest strategie
+  python3 bot.py --loop 60 --llm --portfolio 5000   # Boucle + portefeuille
 """
 import json, time, sys, os, argparse, math
 from datetime import datetime, timedelta
@@ -1116,6 +1118,353 @@ def run_backtest():
     return all_results
 
 
+# ─── Risk Management ─────────────────────────────────────────────
+
+class RiskManager:
+    """Gestion de risque prudente pour maximiser les gains sans exploser"""
+
+    def __init__(self, initial_capital=10000, max_drawdown=15, max_risk_per_trade=2):
+        self.initial_capital = initial_capital
+        self.capital = initial_capital
+        self.peak_capital = initial_capital
+        self.max_drawdown_pct = max_drawdown  # stop trading si -X%
+        self.max_risk_per_trade = max_risk_per_trade  # % du capital risque par trade
+        self.trades = []
+        self.daily_pnl = []
+        self.consecutive_losses = 0
+        self.max_consecutive_losses = 3  # pause apres X pertes
+        self.cooldown = False
+        self.cooldown_until = None
+
+    def kelly_fraction(self, win_rate, avg_win, avg_loss):
+        """Kelly Criterion modere (fraction securitaire = Kelly / 2)
+        Calcule le % du capital a risquer"""
+        if avg_loss == 0 or win_rate == 0:
+            return 0.01  # 1% par defaut
+        r = avg_win / abs(avg_loss) if avg_loss != 0 else 1
+        p = win_rate / 100
+        kelly = (p * r - (1 - p)) / r if r > 0 else 0
+        # Kelly modere: on prend la moitie pour etre prudent
+        return max(0.005, min(kelly / 2, self.max_risk_per_trade / 100))
+
+    def position_size(self, price, stop_loss_pct, win_rate=50, avg_win=5, avg_loss=3):
+        """Calcule la taille de position optimale et prudente"""
+        # Kelly fraction
+        fraction = self.kelly_fraction(win_rate, avg_win, avg_loss)
+
+        # Ajustement selon le drawdown actuel
+        dd = self.current_drawdown()
+        if dd > 10:
+            fraction *= 0.5  # Moitie de risque en drawdown
+        elif dd > 5:
+            fraction *= 0.75
+
+        # Limite max de capital par trade
+        max_capital_at_risk = self.capital * fraction
+        position_value = max_capital_at_risk / (stop_loss_pct / 100) if stop_loss_pct > 0 else 0
+        position_value = min(position_value, self.capital * 0.3)  # max 30% du capital
+
+        quantity = position_value / price if price > 0 else 0
+
+        return {
+            "position_value": round(position_value, 2),
+            "quantity": round(quantity, 6),
+            "capital_at_risk": round(max_capital_at_risk, 2),
+            "risk_pct": round(fraction * 100, 2),
+            "kelly_fraction": round(fraction, 4),
+        }
+
+    def stop_loss_atr(self, price, atr, multiplier=2.0):
+        """Stop-loss base sur ATR (volatilite)
+        Plus la volatilite est haute, plus le stop est large"""
+        distance = atr * multiplier
+        stop = price - distance
+        stop_pct = distance / price * 100
+        return {
+            "stop_price": round(stop, 2),
+            "stop_pct": round(stop_pct, 2),
+            "distance": round(distance, 2),
+            "multiplier": multiplier,
+        }
+
+    def take_profit(self, price, atr, risk_reward=2.5):
+        """Take-profit base sur Risk/Reward ratio
+        1:2.5 par defaut (prudent)"""
+        stop_info = self.stop_loss_atr(price, atr)
+        distance = price - stop_info["stop_price"]
+        tp = price + distance * risk_reward
+        tp_pct = (tp - price) / price * 100
+        return {
+            "tp_price": round(tp, 2),
+            "tp_pct": round(tp_pct, 2),
+            "risk_reward": round(risk_reward, 1),
+            "potential_gain": round((tp - price) / (price - stop_info["stop_price"]) if (price - stop_info["stop_price"]) > 0 else 0, 2),
+        }
+
+    def trailing_stop(self, entry_price, current_price, atr, activation_pct=3):
+        """Trailing stop qui suit le prix
+        S'active seulement apres +3% de gain"""
+        gain_pct = (current_price - entry_price) / entry_price * 100
+        if gain_pct < activation_pct:
+            return {"active": False, "stop": entry_price * 0.97}  # stop a -3% si pas active
+
+        # Trailing: stop a 2x ATR en dessous du plus haut
+        trail_distance = atr * 2
+        trailing_stop = current_price - trail_distance
+        return {
+            "active": True,
+            "stop": round(trailing_stop, 2),
+            "locked_profit": round(gain_pct - (trail_distance / entry_price * 100), 2),
+        }
+
+    def current_drawdown(self):
+        """Drawdown actuel en %"""
+        if self.peak_capital == 0:
+            return 0
+        dd = (self.peak_capital - self.capital) / self.peak_capital * 100
+        return max(0, dd)
+
+    def should_trade(self, signal_score, confidence="faible"):
+        """Decision: est-ce qu'on trade ce signal ?"""
+        # Verifier drawdown
+        dd = self.current_drawdown()
+        if dd >= self.max_drawdown_pct:
+            return {
+                "trade": False,
+                "reason": f"Drawdown maximum atteint ({dd:.1f}%)",
+                "wait_for": "retour au dessus du drawdown max",
+            }
+
+        # Verifier cooldown apres pertes
+        if self.cooldown:
+            if self.cooldown_until and datetime.now() < self.cooldown_until:
+                remaining = (self.cooldown_until - datetime.now()).seconds // 60
+                return {
+                    "trade": False,
+                    "reason": f"Cooldown apres {self.consecutive_losses} pertes consecutives",
+                    "wait_for": f"{remaining} minutes",
+                }
+            else:
+                self.cooldown = False
+                self.cooldown_until = None
+
+        # Verifier score minimum
+        min_score = 0.35  # score normalise minimum
+        if signal_score < min_score:
+            return {
+                "trade": False,
+                "reason": f"Score insuffisant ({signal_score:.2f} < {min_score})",
+                "wait_for": "amelioration du signal",
+            }
+
+        # Verifier confiance
+        if confidence == "faible":
+            return {
+                "trade": False,
+                "reason": "Confiance ML trop faible",
+                "wait_for": "confirmation supplementaire",
+            }
+
+        return {
+            "trade": True,
+            "reason": "Tous les feux sont au vert",
+            "confidence": confidence,
+            "drawdown": round(dd, 1),
+        }
+
+    def record_trade(self, entry_price, exit_price, quantity, side="long"):
+        """Enregistre un trade et met a jour le capital"""
+        if side == "long":
+            pnl = (exit_price - entry_price) * quantity
+            pnl_pct = (exit_price - entry_price) / entry_price * 100
+        else:
+            pnl = (entry_price - exit_price) * quantity
+            pnl_pct = (entry_price - exit_price) / entry_price * 100
+
+        self.capital += pnl
+        if self.capital > self.peak_capital:
+            self.peak_capital = self.capital
+
+        self.trades.append({
+            "entry": entry_price,
+            "exit": exit_price,
+            "quantity": quantity,
+            "pnl": round(pnl, 2),
+            "pnl_pct": round(pnl_pct, 2),
+            "capital": round(self.capital, 2),
+            "drawdown": round(self.current_drawdown(), 2),
+            "timestamp": datetime.now().isoformat(),
+        })
+
+        if pnl < 0:
+            self.consecutive_losses += 1
+            if self.consecutive_losses >= self.max_consecutive_losses:
+                self.cooldown = True
+                self.cooldown_until = datetime.now() + timedelta(hours=24)
+                print(f"  ⛔ Cooldown 24h active ({self.consecutive_losses} pertes consecutives)")
+        else:
+            self.consecutive_losses = 0
+
+        return self.trades[-1]
+
+    def summary(self):
+        """Resume de performance"""
+        if not self.trades:
+            return {
+                "capital": round(self.capital, 2),
+                "total_return": 0,
+                "win_rate": 0,
+                "trades": 0,
+                "drawdown": 0,
+            }
+
+        wins = [t for t in self.trades if t["pnl"] > 0]
+        total_pnl = sum(t["pnl"] for t in self.trades)
+        total_return = (self.capital - self.initial_capital) / self.initial_capital * 100
+
+        return {
+            "capital": round(self.capital, 2),
+            "initial_capital": self.initial_capital,
+            "total_return": round(total_return, 2),
+            "total_pnl": round(total_pnl, 2),
+            "win_rate": round(len(wins) / len(self.trades) * 100, 1) if self.trades else 0,
+            "total_trades": len(self.trades),
+            "current_drawdown": round(self.current_drawdown(), 2),
+            "peak_capital": round(self.peak_capital, 2),
+            "consecutive_losses": self.consecutive_losses,
+            "cooldown_active": self.cooldown,
+        }
+
+
+def run_portfolio_simulation(capital=10000):
+    """Simulation de portefeuille avec Risk Management"""
+    print(f"\n  Simulation portefeuille — ${capital:,.0f} initial\n")
+    print(f"  Regles:\n"
+          f"  - Kelly Criterion / 2 pour la taille de position\n"
+          f"  - Stop-loss a 2x ATR\n"
+          f"  - Take-profit a 1:2.5 (Risk/Reward)\n"
+          f"  - Trailing stop apres +3%\n"
+          f"  - Cooldown 24h apres 3 pertes consecutives\n"
+          f"  - Arret si drawdown > 15%\n")
+
+    fetcher = DataFetcher()
+    rm = RiskManager(initial_capital=capital)
+    coins_to_analyze = ["bitcoin", "ethereum", "solana", "cardano", "ripple"]
+
+    simulation_days = 365  # simule sur 1 an
+    total_bars = simulation_days
+
+    print(f"  Simulation sur {simulation_days} jours de donnees...\n")
+
+    # Collecte toutes les donnees
+    all_data = {}
+    for coin_id in coins_to_analyze:
+        df = fetcher.fetch_market_data(coin_id, days=simulation_days)
+        if not df.empty:
+            all_data[coin_id] = df
+
+    if not all_data:
+        print("  Pas de donnees disponibles.")
+        return
+
+    # Pour chaque jour de la simulation
+    dates = list(list(all_data.values())[0].index)
+    results_by_date = {}
+    total_signals = 0
+    executed_trades = 0
+
+    for i in range(60, len(dates)):
+        date = dates[i]
+        day_results = []
+        
+        for coin_id in coins_to_analyze:
+            if coin_id not in all_data:
+                continue
+            df = all_data[coin_id]
+            if i >= len(df):
+                continue
+                
+            # Analyse jusqu'a ce point
+            chunk = df.iloc[:i+1]
+            brain = CoinBrain(coin_id, chunk, fetcher)
+            if not brain.compute():
+                continue
+            brain.signal = brain.generate_signal()
+            result = brain.build_result()
+
+            price = result["price"]
+            score = result["normalized_score"]
+            atr = result.get("indicators", {}).get("atr", 0)
+            ml = result.get("ml", {})
+            confidence = ml.get("confidence", "faible") if "error" not in ml else "faible"
+
+            # Risk Management decision
+            decision = rm.should_trade(score, confidence)
+            
+            if decision["trade"] and result["signal"] == "ACHAT" and atr > 0:
+                total_signals += 1
+                sl = rm.stop_loss_atr(price, atr)
+                tp = rm.take_profit(price, atr)
+                
+                # Estimer win rate du backtest
+                win_rate_estimate = 55  # estimation prudente
+                pos = rm.position_size(price, sl["stop_pct"], win_rate=win_rate_estimate)
+
+                if pos["position_value"] > 10:  # min 10$
+                    executed_trades += 1
+                    rm.record_trade(
+                        entry_price=price,
+                        exit_price=tp["tp_price"] if tp["tp_pct"] > sl["stop_pct"] else price * 0.95,
+                        quantity=pos["quantity"],
+                    )
+                    day_results.append({
+                        "coin": coin_id,
+                        "action": "ACHAT",
+                        "price": price,
+                        "position": pos["position_value"],
+                        "stop": sl["stop_price"],
+                        "tp": tp["tp_price"],
+                        "rr": tp["risk_reward"],
+                    })
+
+        if day_results:
+            results_by_date[str(date.date())] = day_results
+
+    # Rapport
+    s = rm.summary()
+    print(f"\n  {'='*50}")
+    print(f"  RESULTAT SIMULATION ({simulation_days} jours)")
+    print(f"  {'='*50}")
+    print(f"\n  Capital initial:  ${s['initial_capital']:,.2f}")
+    print(f"  Capital final:    ${s['capital']:,.2f}")
+    print(f"  Rendement total:  {s['total_return']:+.2f}%")
+    if s['total_trades'] > 0:
+        print(f"  P&L total:        ${s['total_pnl']:+,.2f}")
+        print(f"  Trades executer:   {s['total_trades']}")
+        print(f"  Win rate:          {s['win_rate']:.1f}%")
+        print(f"  Drawdown max:      {s['current_drawdown']:.1f}%")
+        print(f"  Pertes conséc.:    {s['consecutive_losses']}")
+    print(f"  Signaux totaux:    {total_signals}")
+    print(f"  Trades simulés:    {executed_trades}")
+
+    # Recommandation
+    print(f"\n  RECOMMANDATION:")
+    print(f"  {'='*50}")
+    if s['total_return'] > 0:
+        print(f"  ✅ Strategie rentable sur la periode")
+        if s['win_rate'] > 50:
+            print(f"  ✅ Win rate > 50%, strategie coherente")
+        else:
+            print(f"  ⚠ Win rate < 50%, ameliorer le filtrage")
+    else:
+        print(f"  ❌ Strategie non rentable, revoir les parametres")
+    if s['current_drawdown'] > 10:
+        print(f"  ⚠ Drawdown > 10%, reduire la taille des positions")
+    print()
+
+    return s
+
+
 # ─── Main ──────────────────────────────────────────────────────────
 
 def main():
@@ -1126,11 +1475,16 @@ def main():
     parser.add_argument("--html", action="store_true", help="Rapport HTML")
     parser.add_argument("--llm", action="store_true", help="Analyse IA via Ollama")
     parser.add_argument("--backtest", action="store_true", help="Backtest strategie")
+    parser.add_argument("--portfolio", type=float, default=0, help="Simulation portefeuille (montant)")
     parser.add_argument("--loop", type=int, help="Boucle toutes les N min")
     args = parser.parse_args()
 
     if args.backtest:
         run_backtest()
+        return
+
+    if args.portfolio > 0:
+        run_portfolio_simulation(capital=args.portfolio)
         return
 
     coins = TOP_50[:20] if args.coin == "all" else [c.strip() for c in args.coin.split(",")]

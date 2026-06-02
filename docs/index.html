@@ -1,0 +1,333 @@
+<!DOCTYPE html>
+<html lang="fr">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>Hermes — Votre assistant trading intelligent</title>
+  <style>
+    *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+    html { scroll-behavior: smooth; }
+
+    body {
+      font-family: 'Segoe UI', system-ui, -apple-system, sans-serif;
+      background: #0a0e17;
+      color: #d1d5db;
+      line-height: 1.7;
+      -webkit-font-smoothing: antialiased;
+    }
+
+    .container {
+      max-width: 800px;
+      margin: 0 auto;
+      padding: 0 24px;
+    }
+
+    /* --- Hero --- */
+    .hero {
+      padding: 100px 0 80px;
+      text-align: center;
+      border-bottom: 1px solid rgba(203, 116, 82, 0.15);
+    }
+    .hero h1 {
+      font-size: 2.6rem;
+      font-weight: 700;
+      color: #e8e8e8;
+      letter-spacing: -0.5px;
+      margin-bottom: 16px;
+    }
+    .hero h1 span {
+      color: #cb7452;
+    }
+    .hero p {
+      font-size: 1.15rem;
+      color: #9ca3af;
+      max-width: 480px;
+      margin: 0 auto;
+    }
+
+    /* --- Sections --- */
+    section {
+      padding: 72px 0;
+      border-bottom: 1px solid rgba(255,255,255,0.04);
+    }
+    section:last-of-type { border-bottom: none; }
+
+    h2 {
+      font-size: 1.6rem;
+      font-weight: 600;
+      color: #e8e8e8;
+      margin-bottom: 40px;
+    }
+
+    /* --- Steps --- */
+    .steps {
+      display: flex;
+      flex-direction: column;
+      gap: 32px;
+    }
+    .step {
+      display: flex;
+      gap: 20px;
+      align-items: flex-start;
+    }
+    .step-num {
+      flex-shrink: 0;
+      width: 40px;
+      height: 40px;
+      border-radius: 50%;
+      background: #cb7452;
+      color: #0a0e17;
+      font-weight: 700;
+      font-size: 1.05rem;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+    }
+    .step-content h3 {
+      font-size: 1.1rem;
+      font-weight: 600;
+      color: #e8e8e8;
+      margin-bottom: 6px;
+    }
+    .step-content p {
+      color: #9ca3af;
+      font-size: 0.95rem;
+    }
+
+    /* --- Prudence section --- */
+    .prudence-list {
+      display: grid;
+      grid-template-columns: 1fr 1fr;
+      gap: 16px;
+    }
+    .prudence-item {
+      background: rgba(255,255,255,0.03);
+      border: 1px solid rgba(255,255,255,0.06);
+      border-radius: 10px;
+      padding: 20px;
+    }
+    .prudence-item p {
+      font-size: 0.95rem;
+      color: #d1d5db;
+    }
+    .prudence-item .label {
+      display: inline-block;
+      font-size: 0.75rem;
+      font-weight: 600;
+      text-transform: uppercase;
+      letter-spacing: 0.5px;
+      color: #7aadc4;
+      margin-bottom: 8px;
+    }
+
+    /* --- Technos --- */
+    .technos {
+      display: grid;
+      grid-template-columns: 1fr 1fr;
+      gap: 12px;
+    }
+    .techno {
+      background: rgba(255,255,255,0.02);
+      border: 1px solid rgba(255,255,255,0.05);
+      border-radius: 8px;
+      padding: 16px 20px;
+    }
+    .techno strong {
+      color: #cb7452;
+      font-weight: 600;
+      display: block;
+      margin-bottom: 4px;
+    }
+    .techno span {
+      font-size: 0.9rem;
+      color: #9ca3af;
+    }
+
+    /* --- Tableau rapport --- */
+    .table-wrap {
+      overflow-x: auto;
+    }
+    table {
+      width: 100%;
+      border-collapse: collapse;
+      font-size: 0.95rem;
+    }
+    thead th {
+      text-align: left;
+      padding: 14px 16px;
+      font-weight: 600;
+      color: #9ca3af;
+      font-size: 0.8rem;
+      text-transform: uppercase;
+      letter-spacing: 0.5px;
+      border-bottom: 1px solid rgba(255,255,255,0.08);
+    }
+    tbody td {
+      padding: 14px 16px;
+      border-bottom: 1px solid rgba(255,255,255,0.04);
+    }
+    tbody tr:last-child td { border-bottom: none; }
+    .signal-achat {
+      color: #5bb98c;
+      font-weight: 600;
+    }
+    .signal-neutre {
+      color: #b0a87a;
+      font-weight: 600;
+    }
+    .signal-vente {
+      color: #cb7452;
+      font-weight: 600;
+    }
+    .score {
+      color: #d1d5db;
+    }
+
+    /* --- Footer --- */
+    footer {
+      text-align: center;
+      padding: 40px 0;
+      color: #6b7280;
+      font-size: 0.85rem;
+      border-top: 1px solid rgba(255,255,255,0.04);
+    }
+
+    /* --- Responsive --- */
+    @media (max-width: 640px) {
+      .hero { padding: 64px 0 56px; }
+      .hero h1 { font-size: 1.8rem; }
+      section { padding: 48px 0; }
+      .prudence-list { grid-template-columns: 1fr; }
+      .technos { grid-template-columns: 1fr; }
+      .step { flex-direction: column; }
+      .step-num { margin-bottom: 4px; }
+    }
+  </style>
+</head>
+<body>
+
+  <div class="container">
+
+    <!-- Hero -->
+    <div class="hero">
+      <h1>Hermes — <span>Votre assistant trading intelligent</span></h1>
+      <p>Un bot qui analyse le marche crypto pour vous. Avec l'intelligence artificielle, sans le jargon.</p>
+    </div>
+
+    <!-- Comment ca marche -->
+    <section>
+      <h2>Comment ca marche</h2>
+      <div class="steps">
+        <div class="step">
+          <div class="step-num">1</div>
+          <div class="step-content">
+            <h3>Le bot surveille le marche 24h/24</h3>
+            <p>Il analyse Bitcoin, Ethereum, Solana et les autres grandes crypto-monnaies en continu, sans jamais s'arreter.</p>
+          </div>
+        </div>
+        <div class="step">
+          <div class="step-num">2</div>
+          <div class="step-content">
+            <h3>15 indicateurs passes au crible</h3>
+            <p>RSI, tendances, volume, volatilite... 15 parametres differents sont examines avant chaque decision.</p>
+          </div>
+        </div>
+        <div class="step">
+          <div class="step-num">3</div>
+          <div class="step-content">
+            <h3>L'IA donne son verdict</h3>
+            <p>Une analyse claire et detaillee, en francais, avec un signal Achat, Neutre ou Vente pour chaque actif.</p>
+          </div>
+        </div>
+      </div>
+    </section>
+
+    <!-- Prudence -->
+    <section>
+      <h2>La prudence avant tout</h2>
+      <div class="prudence-list">
+        <div class="prudence-item">
+          <div class="label">Regle n°1</div>
+          <p>Jamais plus de 2% du capital risque par trade</p>
+        </div>
+        <div class="prudence-item">
+          <div class="label">Regle n°2</div>
+          <p>Stop-loss automatique qui s'adapte a la volatilite</p>
+        </div>
+        <div class="prudence-item">
+          <div class="label">Regle n°3</div>
+          <p>Pause automatique apres des pertes</p>
+        </div>
+        <div class="prudence-item">
+          <div class="label">Regle n°4</div>
+          <p>Protection contre les grosses pertes</p>
+        </div>
+      </div>
+    </section>
+
+    <!-- Technologies -->
+    <section>
+      <h2>Les technologies (simplifiees)</h2>
+      <div class="technos">
+        <div class="techno">
+          <strong>Analyse technique</strong>
+          <span>Des calculs mathematiques qui marchent depuis des decennies pour evaluer le marche.</span>
+        </div>
+        <div class="techno">
+          <strong>Machine Learning</strong>
+          <span>Le bot apprend des tendances passees pour mieux anticiper les mouvements.</span>
+        </div>
+        <div class="techno">
+          <strong>IA Ollama</strong>
+          <span>Un cerveau local qui raisonne sur le marche et formule une analyse en francais.</span>
+        </div>
+        <div class="techno">
+          <strong>Automatisation</strong>
+          <span>Tout est calcule, analyse et resume sans que vous ayez a lever le petit doigt.</span>
+        </div>
+      </div>
+    </section>
+
+    <!-- Exemple de rapport -->
+    <section>
+      <h2>Exemple de rapport</h2>
+      <div class="table-wrap">
+        <table>
+          <thead>
+            <tr>
+              <th>Actif</th>
+              <th>Signal</th>
+              <th>Score</th>
+            </tr>
+          </thead>
+          <tbody>
+            <tr>
+              <td>Bitcoin (BTC)</td>
+              <td class="signal-achat">ACHAT</td>
+              <td class="score">78 / 100</td>
+            </tr>
+            <tr>
+              <td>Ethereum (ETH)</td>
+              <td class="signal-neutre">NEUTRE</td>
+              <td class="score">52 / 100</td>
+            </tr>
+            <tr>
+              <td>Solana (SOL)</td>
+              <td class="signal-vente">VENTE</td>
+              <td class="score">31 / 100</td>
+            </tr>
+          </tbody>
+        </table>
+      </div>
+    </section>
+
+  </div>
+
+  <footer>
+    <div class="container">
+      Hermes Trading Bot — pour Maxime
+    </div>
+  </footer>
+
+</body>
+</html>
