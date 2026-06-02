@@ -588,18 +588,20 @@ class CoinAnalyzer:
                     pass  # Pas besoin de forcer une raison
 
                 # Analyse de sentiment (utilisée comme ajustement global)
-                sent = SentimentAnalyzer()
-                sent_data = sent.get_sentiment()
-                if sent_data.get("available"):
-                    sentiment_adj = sent.get_sentiment_score_adjustment(sent_data.get("score", 0.0))
-                    if sentiment_adj > 1.05:
-                        reasons.append(f"Sentiment marché positif (x{sentiment_adj:.2f})")
-                    elif sentiment_adj < 0.95:
-                        reasons.append(f"Sentiment marché négatif (x{sentiment_adj:.2f})")
+                if self.sentiment:
+                    sent_data = self.sentiment.get_sentiment()
+                    if sent_data.get("available"):
+                        sentiment_adj = self.sentiment.get_sentiment_score_adjustment(sent_data.get("score", 0.0))
+                        if sentiment_adj > 1.05:
+                            reasons.append(f"Sentiment marché positif (x{sentiment_adj:.2f})")
+                        elif sentiment_adj < 0.95:
+                            reasons.append(f"Sentiment marché négatif (x{sentiment_adj:.2f})")
             except Exception as e:
                 log.debug("Erreur brain.py: %s", e)
 
         # Appliquer l'ajustement de sentiment au score
+        if 'sentiment_adj' not in dir():
+            sentiment_adj = 1.0
         score = score * sentiment_adj
 
         # Signal final — seuils ajustes dynamiquement
@@ -717,11 +719,13 @@ class MarketAnalyzer:
         self.global_data = {}
         # Intelligence
         self.brain: Optional['BrainAnalyzer'] = None
+        self.sentiment: Optional['SentimentAnalyzer'] = None
         if BRAIN_OK:
             try:
                 self.brain = BrainAnalyzer()
+                self.sentiment = SentimentAnalyzer()  # Instance unique partagee
             except Exception as e:
-                log.debug("BrainAnalyzer non initialisé: %s", e)
+                log.debug("BrainAnalyzer non initialise: %s", e)
 
     def _init_llm(self):
         try:
@@ -768,10 +772,10 @@ class MarketAnalyzer:
                         self.brain.process_alerts(r, coin)
                     except Exception:
                         pass
-            # Feed price data to brain for correlation
+            # Feed price data to brain for correlation (reutilise les donnees deja chargees)
             if self.brain:
                 try:
-                    df = self.fetcher.fetch_coin_data(coin, days=60)
+                    df = self.fetcher.fetch_coin_data(coin, days=365)
                     if not df.empty:
                         self.brain.feed_price_data(coin, df)
                 except Exception:
@@ -825,8 +829,9 @@ class MarketAnalyzer:
                           f"(confiance {r.get('confidence', 0)*100:.0f}%)")
                     print(f"     {r.get('recommandation', '')}")
                 # Sentiment global
-                sent = SentimentAnalyzer()
-                sent_data = sent.get_sentiment()
+                sent_data = {}
+                if self.sentiment:
+                    sent_data = self.sentiment.get_sentiment()
                 if sent_data.get("available"):
                     print(f"  📰 Sentiment: {sent_data.get('label', '?')} "
                           f"(score {sent_data.get('score', 0):+.3f}) "
@@ -975,8 +980,7 @@ class MarketAnalyzer:
         if self.brain and BRAIN_OK:
             try:
                 brain_data["regime"] = self.results[0].regime if self.results else {}
-                sent = SentimentAnalyzer()
-                brain_data["sentiment"] = sent.get_sentiment()
+                brain_data["sentiment"] = self.sentiment.get_sentiment() if self.sentiment else {}
                 brain_data["correlation"] = self.brain.analyze_correlation()
                 brain_data["alerts"] = self.brain.get_alerts().summary()
             except Exception as e:

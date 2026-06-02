@@ -68,15 +68,8 @@ class MarketRegimeDetector:
         if adx_val is not None and pd.notna(adx_val):
             adx_score = adx_val
         else:
-            # Calcul ADX simplifié si non fourni
-            delta = close.diff()
-            up = delta.where(delta > 0, 0.0)
-            dn = (-delta.where(delta < 0, 0.0))
-            avg_up = up.rolling(14).mean()
-            avg_dn = dn.rolling(14).mean()
-            rs = avg_up / avg_dn.replace(0, np.nan)
-            adx_series = 100 - (100 / (1 + rs))
-            adx_score = float(adx_series.iloc[-1]) if pd.notna(adx_series.iloc[-1]) else 20
+            # Pas assez de donnees pour ADX → valeur neutre
+            adx_score = 20.0
 
         # 2. Bollinger Width → volatilité
         if bb_width_val is not None and pd.notna(bb_width_val):
@@ -896,7 +889,9 @@ class AlertManager:
         has_squeeze = False
         if hasattr(result, 'indicators') and result.indicators:
             bb_p = result.indicators.get("bb_percent")
-            # Squeeze détecté si BB% est très bas ou si le pattern le mentionne
+            # Squeeze: BB% entre 0.45 et 0.55 = prix au milieu des bandes = compression
+            if bb_p is not None and 0.40 < bb_p < 0.60:
+                has_squeeze = True
         if hasattr(result, 'patterns'):
             for p in result.patterns:
                 if "Squeeze" in p or "volatilite" in p.lower():

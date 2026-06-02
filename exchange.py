@@ -268,11 +268,17 @@ class BinanceConnector(ExchangeConnector):
                     continue
 
                 if r.status_code in (401, 403):
-                    log.error(f"Binance authentification échouée ({r.status_code}): {r.text}")
+                    log.error(f"Binance authentification échouée ({r.status_code}): {r.text}")
                     raise PermissionError(
-                        f"Échec d'authentification Binance. Vérifiez vos clés API. "
-                        f"Réponse: {r.text[:200]}"
+                        f"Échec d'authentification Binance. Vérifiez vos clés API. "
+                        f"Réponse: {r.text[:200]}"
                     )
+
+                if r.status_code >= 500:
+                    wait = 5 * (attempt + 1)
+                    log.warning("Binance %d error, retrying in %ds", r.status_code, wait)
+                    time.sleep(wait)
+                    continue
 
                 r.raise_for_status()
                 return r.json()
@@ -282,6 +288,10 @@ class BinanceConnector(ExchangeConnector):
                 time.sleep(5 * (attempt + 1))
             except requests.ConnectionError:
                 log.warning(f"Connection error Binance {endpoint}, tentative {attempt+1}/3")
+                time.sleep(5 * (attempt + 1))
+            except requests.HTTPError as e:
+                log.error(f"HTTP {e}")
+                if attempt == 2: raise
                 time.sleep(5 * (attempt + 1))
 
         raise RuntimeError(f"Échec après 3 tentatives: {endpoint}")
@@ -546,7 +556,7 @@ class PaperTradingConnector(ExchangeConnector):
             raise ValueError(f"Impossible d'obtenir le prix pour {symbol}")
 
         total_cost = quantity * price
-        total_cost_with_fees = total_cost / (1 - self.fees_pct)  # Les frais sont déduits de l'asset
+        total_cost_with_fees = total_cost  # Pas de double count: les frais sont sur la quantite recue
 
         if total_cost_with_fees > self.cash:
             # Acheter avec le maximum disponible
@@ -555,7 +565,7 @@ class PaperTradingConnector(ExchangeConnector):
                 raise ValueError(f"Fonds insuffisants: ${self.cash:.2f} < ${total_cost:.2f}")
             quantity = max_qty
             total_cost = quantity * price
-            total_cost_with_fees = total_cost / (1 - self.fees_pct)
+            total_cost_with_fees = total_cost
 
         # Exécution
         base_asset = symbol.replace("USDT", "").replace("BUSD", "")
