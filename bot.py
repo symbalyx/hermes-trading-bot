@@ -31,6 +31,17 @@ import numpy as np
 import pandas as pd
 import requests
 
+# Exchange connector module
+try:
+    from exchange import (
+        ExchangeConnector, BinanceConnector, PaperTradingConnector,
+        get_connector, execute_signals, load_api_keys, save_api_keys_template,
+        coin_id_to_symbol,
+    )
+    EXCHANGE_OK = True
+except ImportError:
+    EXCHANGE_OK = False
+
 # ─── ML (optionnel) ──────────────────────────────────────────────
 try:
     from sklearn.linear_model import LinearRegression
@@ -53,14 +64,15 @@ for d in [DATA_DIR, CACHE_DIR, LOG_DIR]:
 
 # Logger
 log = logging.getLogger("hermes")
-log.setLevel(logging.INFO)
-fh = logging.FileHandler(LOG_DIR / f"bot_{datetime.now().strftime('%Y%m%d')}.log")
-fh.setFormatter(logging.Formatter('%(asctime)s|%(levelname)s|%(message)s'))
-log.addHandler(fh)
-ch = logging.StreamHandler()
-ch.setFormatter(logging.Formatter('  %(message)s'))
-ch.setLevel(logging.WARNING)  # Console: warnings only
-log.addHandler(ch)
+if not log.handlers:
+    log.setLevel(logging.INFO)
+    fh = logging.FileHandler(LOG_DIR / f"bot_{datetime.now().strftime('%Y%m%d')}.log")
+    fh.setFormatter(logging.Formatter('%(asctime)s|%(levelname)s|%(message)s'))
+    log.addHandler(fh)
+    ch = logging.StreamHandler()
+    ch.setFormatter(logging.Formatter('  %(message)s'))
+    ch.setLevel(logging.WARNING)
+    log.addHandler(ch)
 
 REQUEST_DELAY = 3.0  # secondes entre requetes
 CACHE_TTL = 600  # 10 min
@@ -83,6 +95,8 @@ class DataFetcher:
 
     def __init__(self):
         self.last_request = 0.0
+        self.session = requests.Session()
+        self.session.headers.update({"User-Agent": "HermesTradingBot/4.0"})
 
     def _throttle(self):
         elapsed = time.time() - self.last_request
@@ -107,7 +121,7 @@ class DataFetcher:
         self._throttle()
         for attempt in range(3):
             try:
-                r = requests.get(url, timeout=max(10, 20 - attempt * 5))
+                r = self.session.get(url, timeout=max(10, 20 - attempt * 5))
                 if r.status_code == 429:
                     wait = 15 * (attempt + 1)
                     log.warning(f"Rate limited, attente {wait}s")
@@ -149,7 +163,7 @@ class DataFetcher:
         volumes = pd.DataFrame(data.get("total_volumes", []), columns=["ts", "volume"])
         df = prices.merge(volumes, on="ts", how="left")
         df["ts"] = pd.to_datetime(df["ts"], unit="ms")
-        df.set_index("ts", inplace=True)
+        df = df.set_index("ts")
         df = df.astype(float)
 
         # Resample quotidien
@@ -455,16 +469,16 @@ class CoinAnalyzer:
         patterns = []
 
         # 1. RSI (poids 2)
-        w = 2.0; max_score += w
         if rsi_val is not None:
+            w = 2.0; max_score += w
             if rsi_val < 30: score += w; reasons.append(f"RSI survente ({rsi_val:.1f})")
             elif rsi_val < 40: score += w * 0.6; reasons.append(f"RSI bas ({rsi_val:.1f})")
             elif rsi_val > 70: score -= w; reasons.append(f"RSI surachat ({rsi_val:.1f})")
             elif rsi_val > 60: score -= w * 0.6; reasons.append(f"RSI haut ({rsi_val:.1f})")
 
         # 2. MACD (poids 2)
-        w = 2.0; max_score += w
         if macd_h_val is not None:
+            w = 2.0; max_score += w
             macd_l_val = float(macd_l.iloc[-1]) if pd.notna(macd_l.iloc[-1]) else 0
             macd_s_val = float(macd_s.iloc[-1]) if pd.notna(macd_s.iloc[-1]) else 0
             if macd_l_val > macd_s_val:
@@ -473,16 +487,16 @@ class CoinAnalyzer:
                 score -= w; reasons.append("MACD baissier")
 
         # 3. Bollinger (poids 1.5)
-        w = 1.5; max_score += w
         if bb_p_val is not None:
+            w = 1.5; max_score += w
             if bb_p_val < 0.05: score += w; reasons.append("Touche bande basse BB (rebond potentiel)")
             elif bb_p_val < 0.2: score += w * 0.5
             elif bb_p_val > 0.95: score -= w; reasons.append("Touche bande haute BB (revers potentiel)")
             elif bb_p_val > 0.8: score -= w * 0.5
 
         # 4. ADX + Direction (poids 1.5)
-        w = 1.5; max_score += w
         if adx_val is not None:
+            w = 1.5; max_score += w
             pdi_val = float(pdi.iloc[-1]) if pd.notna(pdi.iloc[-1]) else 0
             ndi_val = float(ndi.iloc[-1]) if pd.notna(ndi.iloc[-1]) else 0
             if adx_val > 25:
@@ -497,26 +511,26 @@ class CoinAnalyzer:
                 else: score -= w * 0.3
 
         # 5. Stochastique (poids 1)
-        w = 1.0; max_score += w
         if stoch_k_val is not None:
+            w = 1.0; max_score += w
             if stoch_k_val < 20: score += w; reasons.append("Stochastique survente")
             elif stoch_k_val > 80: score -= w; reasons.append("Stochastique surachat")
             elif stoch_k_val < 30: score += w * 0.3
             elif stoch_k_val > 70: score -= w * 0.3
 
-        # 6. MFI (poids 1) — confirme volume
-        w = 1.0; max_score += w
+        # 6. MFI (poids 1)
         if mfi_val is not None:
+            w = 1.0; max_score += w
             if mfi_val < 20: score += w; reasons.append(f"MFI survente ({mfi_val:.0f})")
             elif mfi_val > 80: score -= w; reasons.append(f"MFI surachat ({mfi_val:.0f})")
 
         # 7. Volume (poids 1.5)
-        w = 1.5; max_score += w
-        if vol_r_val is not None:
+        if vol_r_val is not None and vol_r_val != float('inf'):
+            w = 1.5; max_score += w
             if vol_r_val > 1.5: score += w * 0.5; reasons.append(f"Volume x{vol_r_val:.1f}")
             elif vol_r_val < 0.3: score -= w * 0.5
 
-        # 8. Tendance reg lin (poids 2) — REMPLACE le ML defectueux
+        # 8. Tendance reg lin (poids 2)
         w = 2.0; max_score += w
         if trend_data["trend"] == "bullish":
             score += w * (trend_data["strength"] / 100)
@@ -527,20 +541,22 @@ class CoinAnalyzer:
             if trend_data["strength"] > 50:
                 reasons.append(f"Tendance baissiere confirmee ({trend_data['strength']:.0f}%)")
 
-        # 9. Divergences (poids 2) — NOUVEAU: integree dans le score
-        w = 2.0; max_score += w
-        for div in divergences:
-            if div["type"] == "bullish":
+        # 9. Divergences (poids 2)
+        if divergences:
+            w = 2.0; max_score += w
+            for div in divergences:
                 mult = 1.5 if div["strength"] == "strong" else 0.8
-                score += w * mult
-                reasons.append(f"Divergence haussiere (prix ${div['price']:.2f})")
-            elif div["type"] == "bearish":
-                mult = 1.5 if div["strength"] == "strong" else 0.8
-                score -= w * mult
-                reasons.append(f"Divergence baissiere (prix ${div['price']:.2f})")
-
+                if div["type"] == "bullish":
+                    score += w * mult
+                    reasons.append(f"Divergence haussiere (${div['price']:.2f})")
+                elif div["type"] == "bearish":
+                    score -= w * mult
+                    reasons.append(f"Divergence baissiere (${div['price']:.2f})")
+        
         # Signal final — seuils ajustes dynamiquement
         normalized = score / max_score if max_score > 0 else 0
+        if math.isnan(normalized) or math.isinf(normalized):
+            normalized = 0.0
 
         # Seuils ajustes: moins severes que v3 (0.35 -> 0.25)
         if normalized >= 0.25: signal = "ACHAT"; niveau = "FORT" if normalized >= 0.45 else "MOYEN"
@@ -727,8 +743,10 @@ class MarketAnalyzer:
             print(f"  {'-'*65}")
             for r in top_buys[:5]:
                 div_str = f"{len(r.divergences)} div" if r.divergences else "-"
+                rsi_str = f"{r.rsi:.1f}" if r.rsi is not None else "-"
+                adx_str = f"{r.adx:.1f}" if r.adx is not None else "-"
                 print(f"  {r.name:<20} ${r.price:<10.2f} {r.normalized_score:+.2f}  "
-                      f"{r.rsi or '-':<6.1f} {r.adx or '-':<6.1f} {r.trend['direction']:<12} {div_str:<10}")
+                      f"{rsi_str:<6} {adx_str:<6} {r.trend['direction']:<12} {div_str:<10}")
 
         if top_sells:
             print(f"\n  TOP VENTES")
@@ -1024,6 +1042,13 @@ class RiskManager:
         self.capital += pnl
         if self.capital > self.peak: self.peak = self.capital
         won = pnl > 0
+        self.trades.append({
+            "entry": entry, "exit": exit_price, "quantity": qty,
+            "pnl": round(pnl, 2),
+            "pnl_pct": round((exit_price - entry) / entry * 100, 2),
+            "capital": round(self.capital, 2),
+            "ts": datetime.now().isoformat(),
+        })
         self.loss_streak = 0 if won else self.loss_streak + 1
         if self.loss_streak >= 3:
             self.cooldown_until = datetime.now() + timedelta(hours=12)  # 12h au lieu de 24h
@@ -1173,10 +1198,66 @@ def main():
     parser.add_argument("--backtest", action="store_true", help="Backtest")
     parser.add_argument("--portfolio", type=float, default=0, help="Simulation montant")
     parser.add_argument("--loop", type=int, help="Boucle toutes les N min")
+    # Exchange flags
+    exchange_group = parser.add_mutually_exclusive_group()
+    exchange_group.add_argument("--live", action="store_true",
+                                help="Trading réel (Binance) — nécessite api_keys.json")
+    exchange_group.add_argument("--paper", action="store_true", default=True,
+                                help="Trading papier simulé (défaut)")
+    parser.add_argument("--capital", type=float, default=10000,
+                        help="Capital initial pour paper trading")
+    parser.add_argument("--testnet", action="store_true",
+                        help="Utiliser le testnet Binance (au lieu du mainnet)")
+    parser.add_argument("--trade", action="store_true",
+                        help="Exécuter automatiquement les signaux détectés")
+    parser.add_argument("--max-positions", type=int, default=5,
+                        help="Nombre max de positions simultanées")
+    parser.add_argument("--create-keys", action="store_true",
+                        help="Créer le fichier api_keys.json template")
     args = parser.parse_args()
 
     if args.backtest: run_backtest(); return
     if args.portfolio > 0: run_portfolio_simulation(args.portfolio); return
+
+    # ─── Exchange connector setup ────────────────────────────────
+    if args.create_keys:
+        if EXCHANGE_OK:
+            save_api_keys_template()
+        else:
+            print("  ❌ Module exchange.py introuvable")
+        return
+
+    exchange_mode = "live" if args.live else "paper"
+    connector = None
+    risk_mgr = None
+
+    if args.trade:
+        if not EXCHANGE_OK:
+            print("  ❌ Module exchange.py introuvable — impossible de trader")
+            print("  Le fichier exchange.py doit être dans le même dossier que bot.py")
+            sys.exit(1)
+
+        if exchange_mode == "live" and args.testnet:
+            print("  ⚠ Mode testnet Binance activé (pas d'argent réel)")
+        elif exchange_mode == "live":
+            print("  🔴 MODE LIVE — TRADING RÉEL BINANCE")
+            print("  Vérifiez vos clés API et le fichier api_keys.json")
+        else:
+            print(f"  📋 Mode PAPER TRADING — ${args.capital:,.0f} virtuels")
+
+        try:
+            connector = get_connector(
+                mode=exchange_mode,
+                initial_capital=args.capital,
+                testnet=args.testnet,
+            )
+            risk_mgr = RiskManager(capital=args.capital)
+            info = connector.get_info()
+            print(f"  Connecteur: {info['name']} ({info['type']})")
+        except ValueError as e:
+            print(f"  ❌ {e}")
+            print("  Utilisez --paper ou configurez data/api_keys.json")
+            sys.exit(1)
 
     coins = TOP_50[:20] if args.coin == "all" else [c.strip() for c in args.coin.split(",")]
     analyzer = MarketAnalyzer(use_llm=args.llm)
@@ -1187,11 +1268,52 @@ def main():
         print(f"\n{'#'*65}")
         print(f"# HERMES TRADING BOT v4 — {len(coins)} actifs | Iteration #{it}")
         if args.llm: print("# Mode IA: actif")
+        if connector:
+            mode_str = "LIVE 🔴" if exchange_mode == "live" else f"Paper 📋 ${args.capital:,.0f}"
+            print(f"# Exchange: {mode_str}")
         print(f"{'#'*65}")
 
         analyzer.analyze_multiple(coins)
         analyzer.print_report()
         if args.save or args.html: analyzer.save_report(html=args.html)
+
+        # ─── Exécution des signaux ────────────────────────────────
+        if connector and risk_mgr and args.trade and analyzer.results:
+            trades = execute_signals(
+                results=analyzer.results,
+                connector=connector,
+                risk_manager=risk_mgr,
+                dry_run=False,
+                max_positions=args.max_positions,
+            )
+
+            if trades:
+                print(f"\n  TRADES EXÉCUTÉS:")
+                for t in trades[:10]:
+                    action_icon = "🟢" if t.get("action") == "BUY" else "🔴"
+                    err = t.get("error")
+                    if err:
+                        print(f"    {action_icon} {t.get('action', '?')} {t.get('symbol', '?')} "
+                              f"— ❌ {err}")
+                    elif t.get("dry_run"):
+                        print(f"    📋 {action_icon} {t['action']} {t['symbol']} "
+                              f"— {t.get('quantity', 0):.6f} @ ${t.get('price', 0):.2f} "
+                              f"[DRY RUN]")
+                    else:
+                        print(f"    {action_icon} {t['action']} {t['symbol']} "
+                              f"— {t.get('quantity', 0):.6f} @ ${t.get('price', 0):.2f} "
+                              f"| ordre #{t.get('order_id', '?')} [{t.get('status', '?')}]")
+
+                # Résumé du portefeuille papier
+                if isinstance(connector, PaperTradingConnector):
+                    ps = connector.get_portfolio_summary()
+                    print(f"\n  📊 PORTEFEUILLE PAPIER:")
+                    print(f"     Cash: ${ps['cash']:,.2f} | Holdings: ${ps['holdings_value']:,.2f}")
+                    print(f"     Total: ${ps['total_value']:,.2f} "
+                          f"({ps['pnl_pct']:+.2f}% | ${ps['pnl']:+,.2f})")
+                    print(f"     Trades: {ps['total_trades']} | Positions: {len(ps['positions'])}")
+            else:
+                print(f"\n  Aucun trade exécuté cette itération")
 
         if not args.loop: break
         time.sleep(args.loop * 60)

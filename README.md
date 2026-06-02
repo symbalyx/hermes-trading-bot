@@ -1,50 +1,55 @@
-# Hermes Trading Bot
+# Hermes Trading Bot 🤖📈
 
-Analyse intelligente du marche crypto avec IA, Machine Learning et gestion de risque prudente.
+Bot de trading analyse marche cree par **Hermes Agent** (Nous Research).
 
-→ **Site web :** https://symbalyx.github.io/hermes-trading-bot/
-→ **Strategie :** STRATEGIE.md
+Analyse les marches crypto via CoinGecko API (gratuit, sans cle API).
 
 ## Fonctionnalites
 
-- **Analyse technique avancee** — RSI, MACD, Bollinger Bands, ADX, Stochastique, MFI, Heikin Ashi, ATR, Fibonacci, divergences RSI/prix
-- **Machine Learning** — RandomForest + LinearRegression pour predictions de tendance
-- **IA narrative** — analyse raisonnee du marche via Ollama (qwen2.5:3b)
-- **Risk Management** — Kelly Criterion, position sizing, stop-loss ATR, trailing stop, drawdown protection, cooldown
-- **Backtesting** — validation historique de la strategie
-- **Portfolio simulation** — simulation de portefeuille avec P&L
-- **Rapports HTML/JSON** — tableau complet avec tous les indicateurs
+- **Indicateurs techniques** : RSI (14), SMA (20/50/200), MACD (12/26/9)
+- **Signaux trading** : ACHAT / VENTE / NEUTRE avec score pondere
+- **Support/Resistance** : niveaux automatiques sur 50 periodes
+- **Volume** : ratio volume recent vs moyenne 7 jours
+- **Top picks** : classement des meilleurs signaux du marche
 
 ## Usage
 
 ```bash
-# Analyse rapide
+# Analyser Bitcoin et Ethereum
 python3 bot.py
 
-# Analyse avec IA
-python3 bot.py --coin all --llm
+# Analyser des coins specifiques
+python3 bot.py --coin bitcoin,cardano,solana
 
-# Simulation portefeuille (10 000 $)
-python3 bot.py --portfolio 10000
+# Analyser le top 20
+python3 bot.py --coin all
 
-# Backtest strategie
-python3 bot.py --backtest
+# Sauvegarder le rapport
+python3 bot.py --coin bitcoin,ethereum --save
 
-# Rapport HTML
-python3 bot.py --coin bitcoin,ethereum,solana --html --save --llm
+# Analyse en boucle (toutes les 30 min)
+python3 bot.py --coin bitcoin --loop 30
+```
+
+## Sortie
+
+```
+==================================================
+  BITCOIN — analyse 14:30 02/06/2026
+==================================================
+  Prix:     $68,452
+  24h:      +2.34%
+  Volume:   1.2x moyenne recente
+  RSI(14):  58.4
+  SMA20:    $67,890  SMA50: $65,432
+  MACD:     245  Signal: 198  Hist: 47
+  Support:  $62,100  Resistance: $71,500
+  SIGNAL:   ⚪ NEUTRE (FAIBLE) — score 1/7
+    → RSI neutre (58.4)
+    → Prix > SMA20 ($67,890$)
 ```
 
 ## Dependances
 
-```bash
-pip install requests pandas numpy scikit-learn
-```
-
-## GitHub Pages
-
-Le site explicatif est accessible sur :
-https://symbalyx.github.io/hermes-trading-bot/
-
-## Auteur
-
-Pour Maxime Vaslin — Bot cree par Hermes Agent.
+- Python 3.8+
+- requests
