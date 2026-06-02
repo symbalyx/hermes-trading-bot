@@ -31,6 +31,14 @@ import numpy as np
 import pandas as pd
 import requests
 
+# ─── Module intelligence ──────────────────────────────────────────────────
+try:
+    from brain import BrainAnalyzer, MarketRegimeDetector, SentimentAnalyzer, CorrelationMatrix, TimeframeAnalyzer, AlertManager
+    BRAIN_OK = True
+except ImportError as e:
+    BRAIN_OK = False
+    print(f"  ⚠ Module brain.py non chargé: {e}")
+
 # Exchange connector module
 try:
     from exchange import (
@@ -398,6 +406,10 @@ class CoinResult:
     trend_regime: str = "neutral"
     ml_prediction: dict = field(default_factory=dict)
     indicators: dict = field(default_factory=dict)
+    # Intelligence artificielle (brain.py)
+    regime: dict = field(default_factory=dict)
+    sentiment_adjustment: float = 1.0
+    timeframe_analysis: dict = field(default_factory=dict)
 
 
 class CoinAnalyzer:
@@ -552,7 +564,44 @@ class CoinAnalyzer:
                 elif div["type"] == "bearish":
                     score -= w * mult
                     reasons.append(f"Divergence baissiere (${div['price']:.2f})")
-        
+
+        # ── Intelligence: Market Regime Detection ────────────────
+        regime_data = {}
+        sentiment_adj = 1.0
+        if BRAIN_OK:
+            try:
+                bbw_val = float(bb_w.iloc[-1]) if bb_w is not None and pd.notna(bb_w.iloc[-1]) else None
+                regime_data = MarketRegimeDetector.detect(close, adx_val, bbw_val)
+                # Ajustement position factor selon le régime
+                pf = regime_data.get("position_factor", 0.5)
+                if pf < 0.4:
+                    reasons.append(f"Régime: {regime_data.get('label_fr', '?')} — prudence")
+                elif regime_data.get("regime") in ("trending_bullish",):
+                    reasons.append(f"Régime: {regime_data.get('label_fr', '?')} — favorable aux longs")
+                elif regime_data.get("regime") in ("trending_bearish",):
+                    reasons.append(f"Régime: {regime_data.get('label_fr', '?')} — favoriser les shorts")
+                elif regime_data.get("regime") == "ranging":
+                    reasons.append(f"Régime: {regime_data.get('label_fr', '?')} — stratégie range")
+                elif regime_data.get("regime") == "volatile":
+                    reasons.append(f"Régime: {regime_data.get('label_fr', '?')} — réduire positions")
+                elif regime_data.get("regime") == "calm":
+                    pass  # Pas besoin de forcer une raison
+
+                # Analyse de sentiment (utilisée comme ajustement global)
+                sent = SentimentAnalyzer()
+                sent_data = sent.get_sentiment()
+                if sent_data.get("available"):
+                    sentiment_adj = sent.get_sentiment_score_adjustment(sent_data.get("score", 0.0))
+                    if sentiment_adj > 1.05:
+                        reasons.append(f"Sentiment marché positif (x{sentiment_adj:.2f})")
+                    elif sentiment_adj < 0.95:
+                        reasons.append(f"Sentiment marché négatif (x{sentiment_adj:.2f})")
+            except Exception as e:
+                log.debug("Erreur brain.py: %s", e)
+
+        # Appliquer l'ajustement de sentiment au score
+        score = score * sentiment_adj
+
         # Signal final — seuils ajustes dynamiquement
         normalized = score / max_score if max_score > 0 else 0
         if math.isnan(normalized) or math.isinf(normalized):
@@ -577,6 +626,15 @@ class CoinAnalyzer:
                     patterns.append(f"Prix sur Fib {level} (${price_f:.2f})")
                     break
 
+        # ── Multi-timeframe Analysis (CT/MT/LT) ─────────────────
+        timeframe_analysis = {}
+        if BRAIN_OK and len(close) >= 5:
+            try:
+                timeframe_analysis = TimeframeAnalyzer.analyze(close, volume)
+            except Exception as e:
+                log.debug("Erreur TimeframeAnalyzer: %s", e)
+                timeframe_analysis = {"timeframes": {}, "weighted_score": 0, "signal": "NEUTRE", "niveau": "FAIBLE"}
+
         result = CoinResult(
             coin_id=self.coin_id,
             name=self.coin_id.replace("-", " ").title(),
@@ -600,6 +658,9 @@ class CoinAnalyzer:
             trend=trend_data,
             trend_regime=trend_data["trend"],
             ml_prediction=ml,
+            regime=regime_data,
+            sentiment_adjustment=round(sentiment_adj, 3),
+            timeframe_analysis=timeframe_analysis,
             indicators={
                 "rsi": rsi_val, "macd_hist": macd_h_val, "adx": adx_val,
                 "bb_percent": bb_p_val, "stoch_k": stoch_k_val, "mfi": mfi_val,
@@ -654,6 +715,13 @@ class MarketAnalyzer:
         self.use_llm = use_llm
         self.results: list[CoinResult] = []
         self.global_data = {}
+        # Intelligence
+        self.brain: Optional['BrainAnalyzer'] = None
+        if BRAIN_OK:
+            try:
+                self.brain = BrainAnalyzer()
+            except Exception as e:
+                log.debug("BrainAnalyzer non initialisé: %s", e)
 
     def _init_llm(self):
         try:
@@ -687,9 +755,27 @@ class MarketAnalyzer:
 
     def analyze_multiple(self, coins: list[str]) -> list[CoinResult]:
         self.results = []
+        # Reset alerts at start of new analysis session
+        if self.brain:
+            self.brain.reset_alerts()
         for coin in coins:
             r = self.analyze_coin(coin)
-            if r: self.results.append(r)
+            if r:
+                self.results.append(r)
+                # Generate alerts for this result
+                if self.brain:
+                    try:
+                        self.brain.process_alerts(r, coin)
+                    except Exception:
+                        pass
+            # Feed price data to brain for correlation
+            if self.brain:
+                try:
+                    df = self.fetcher.fetch_coin_data(coin, days=60)
+                    if not df.empty:
+                        self.brain.feed_price_data(coin, df)
+                except Exception:
+                    pass
         # Ajouter le contexte global
         try:
             self.global_data = self.fetcher.fetch_global()
@@ -726,8 +812,50 @@ class MarketAnalyzer:
         print(f"  HERMES TRADING BOT v4 — {datetime.now().strftime('%d/%m/%Y %H:%M')}")
         print(f"  Marche: {sm['total']} actifs | ACHAT {sm['achat']} ({sm['achat_fort']} fort) | "
               f"VENTE {sm['vente']} ({sm['vente_fort']} fort) | NEUTRE {sm['neutre']}")
-        print(f"  Tendance marche: {sm['market_trend']} (score moyen {sm['avg_score']:+.2f})")
-        print(f"{'='*65}")
+        print(f"  Tendance marche: {sm['market_trend']} (score moyen {sm['avg_score']:+.2f})\n")
+
+        # ── Intelligence: Régime de marché + Sentiment ───────────
+        if self.brain and self.results and BRAIN_OK:
+            try:
+                # Régime global (basé sur le premier coin avec données)
+                reference_coin = self.results[0]
+                if reference_coin.regime and reference_coin.regime.get("regime"):
+                    r = reference_coin.regime
+                    print(f"  🧠 Régime: {r.get('label_fr', '?')} "
+                          f"(confiance {r.get('confidence', 0)*100:.0f}%)")
+                    print(f"     {r.get('recommandation', '')}")
+                # Sentiment global
+                sent = SentimentAnalyzer()
+                sent_data = sent.get_sentiment()
+                if sent_data.get("available"):
+                    print(f"  📰 Sentiment: {sent_data.get('label', '?')} "
+                          f"(score {sent_data.get('score', 0):+.3f}) "
+                          f"sur {sent_data.get('news_count', 0)} news")
+                # Corrélation
+                corr_data = self.brain.analyze_correlation()
+                if corr_data and corr_data.get("disponible"):
+                    print(f"  🔗 Corrélation moyenne: {corr_data['correlation_moyenne']:.3f} "
+                          f"({corr_data['actifs']} actifs)")
+                    for s in corr_data.get("suggestions_diversification", []):
+                        print(f"     ✓ {s}")
+                # Multi-timeframe global
+                if self.results[0].timeframe_analysis:
+                    tfa = self.results[0].timeframe_analysis
+                    tf_data = tfa.get("timeframes", {})
+                    if tf_data:
+                        tf_parts = []
+                        for tf_key in ["CT", "MT", "LT"]:
+                            tf = tf_data.get(tf_key, {})
+                            if tf:
+                                score = tf.get("score", 0)
+                                sig = tf.get("signal", "?")
+                                tf_parts.append(f"{tf_key} {sig} {score:+.2f}")
+                        print(f"  📊 Multi-timeframe: {' | '.join(tf_parts)}")
+                        print(f"     Score pondéré: {tfa.get('weighted_score', 0):+.2f} "
+                              f"({tfa.get('signal', '?')})")
+            except Exception as e:
+                log.debug("Erreur affichage brain: %s", e)
+            print()
 
         if sm['total'] == 0:
             return
@@ -769,6 +897,21 @@ class MarketAnalyzer:
             if r.vol_ratio: parts.append(f"Vol {r.vol_ratio}x")
             if parts: print(f"     {' | '.join(parts)}")
 
+            # Multi-timeframe (CT/MT/LT)
+            if r.timeframe_analysis:
+                tfa = r.timeframe_analysis
+                tf_data = tfa.get("timeframes", {})
+                if tf_data:
+                    tf_parts = []
+                    for tf_key in ["CT", "MT", "LT"]:
+                        tf = tf_data.get(tf_key, {})
+                        if tf and tf.get("score") is not None:
+                            sig_icon = "🟢" if tf.get("signal") == "ACHAT" else "🔴" if tf.get("signal") == "VENTE" else "⚪"
+                            tf_parts.append(f"{tf_key} {sig_icon} {tf.get('score', 0):+.2f}")
+                    if tf_parts:
+                        print(f"     📊 CT/MT/LT: {' | '.join(tf_parts)} "
+                              f"(pondéré {tfa.get('weighted_score', 0):+.2f})")
+
             # ML remplace par tendance
             if r.ml_prediction and "error" not in r.ml_prediction:
                 ml = r.ml_prediction
@@ -789,10 +932,23 @@ class MarketAnalyzer:
                 print(f"     → {reason}")
             for p in r.patterns[:2]:
                 print(f"     ★ {p}")
+            # Régime du coin
+            if r.regime and r.regime.get("regime") and r.regime["regime"] != "inconnu":
+                print(f"     🧠 Régime: {r.regime.get('label_fr','?')} "
+                      f"(confiance {r.regime.get('confidence',0)*100:.0f}%)")
 
         # LLM Analysis
         if self.llm and self.use_llm:
             self._llm_report(top_buys[:5], top_sells[:3], sm)
+
+        # ── ALERTES DU JOUR ──────────────────────────────────────
+        if self.brain and BRAIN_OK:
+            try:
+                alerts_text = self.brain.get_alerts().format_report()
+                if alerts_text:
+                    print(f"\n{alerts_text}\n")
+            except Exception as e:
+                log.debug("Erreur affichage alertes: %s", e)
 
     def _llm_report(self, top_buys, top_sells, summary):
         print(f"\n  Analyse IA:")
@@ -810,12 +966,26 @@ class MarketAnalyzer:
             print("  (IA non disponible)")
 
     def save_report(self, html=True):
-        """Sauvegarde rapport JSON + HTML"""
+        """Sauvegarde rapport JSON + HTML avec données brain.py"""
         valid = [r for r in self.results if r]
         ts = datetime.now().strftime("%Y%m%d_%H%M")
+
+        # Données brain.py
+        brain_data = {}
+        if self.brain and BRAIN_OK:
+            try:
+                brain_data["regime"] = self.results[0].regime if self.results else {}
+                sent = SentimentAnalyzer()
+                brain_data["sentiment"] = sent.get_sentiment()
+                brain_data["correlation"] = self.brain.analyze_correlation()
+                brain_data["alerts"] = self.brain.get_alerts().summary()
+            except Exception as e:
+                brain_data["error"] = str(e)
+
         report = {
             "generated_at": datetime.now().isoformat(),
             "market_summary": self.get_summary(),
+            "brain_analysis": brain_data,
             "results": [{
                 "coin": r.coin_id, "name": r.name, "price": r.price,
                 "change_24h": r.change_24h, "signal": r.signal,
@@ -823,7 +993,9 @@ class MarketAnalyzer:
                 "reasons": r.reasons, "patterns": r.patterns,
                 "divergences": r.divergences, "fibonacci": r.fibonacci,
                 "indicators": r.indicators, "ml_prediction": r.ml_prediction,
-                "trend": r.trend,
+                "trend": r.trend, "regime": r.regime,
+                "sentiment_adjustment": r.sentiment_adjustment,
+                "timeframe_analysis": r.timeframe_analysis,
             } for r in valid],
         }
 
@@ -861,6 +1033,21 @@ class MarketAnalyzer:
             reasons = "<br>".join([f"• {re}" for re in r.reasons[:4]])
             patterns = "".join([f'<div class="p">{p}</div>' for p in r.patterns[:2]])
 
+            regime_label = r.regime.get("label_fr", "-") if r.regime else "-"
+            regime_conf = f"{r.regime.get('confidence', 0)*100:.0f}%" if r.regime else "-"
+
+            # Multi-timeframe HTML
+            tfa = r.timeframe_analysis or {}
+            tf_data = tfa.get("timeframes", {})
+            ct_score = tf_data.get("CT", {}).get("score", "")
+            mt_score = tf_data.get("MT", {}).get("score", "")
+            lt_score = tf_data.get("LT", {}).get("score", "")
+            ct_str = f"{ct_score:+.2f}" if isinstance(ct_score, (int, float)) else "-"
+            mt_str = f"{mt_score:+.2f}" if isinstance(mt_score, (int, float)) else "-"
+            lt_str = f"{lt_score:+.2f}" if isinstance(lt_score, (int, float)) else "-"
+            tf_weighted = tfa.get("weighted_score", "")
+            tf_w_str = f"{tf_weighted:+.2f}" if isinstance(tf_weighted, (int, float)) else "-"
+
             rows += f"""<tr>
                 <td><strong>{r.name}</strong></td>
                 <td>{self._fmt_price(r.price)}</td>
@@ -872,9 +1059,15 @@ class MarketAnalyzer:
                 <td>{ml_str}</td>
                 <td>{r.vol_ratio or '-'}x</td>
                 <td>{r.atr_pct or '-'}%</td>
+                <td>{ct_str}</td>
+                <td>{mt_str}</td>
+                <td>{lt_str}</td>
+                <td>{tf_w_str}</td>
                 <td>{fib618}</td>
                 <td>{divs}</td>
                 <td><small>{reasons}{patterns}</small></td>
+                <td>{regime_label}</td>
+                <td>{regime_conf}</td>
             </tr>"""
 
         html = f"""<!DOCTYPE html>
@@ -908,7 +1101,7 @@ tr:hover td {{ background:#111827; }}
 <div class="card"><h3>Score moy.</h3><div class="val" style="color:#ffc107;">{sm['avg_score']:+.2f}</div></div>
 </div>
 <table><thead><tr>
-<th>Coin</th><th>Prix</th><th>Score</th><th>Signal</th><th>RSI</th><th>MACDh</th><th>ADX</th><th>Tendance</th><th>Vol</th><th>ATR</th><th>Fib618</th><th>Diverg</th><th>Analyse</th>
+<th>Coin</th><th>Prix</th><th>Score</th><th>Signal</th><th>RSI</th><th>MACDh</th><th>ADX</th><th>Tendance</th><th>Vol</th><th>ATR</th><th>CT</th><th>MT</th><th>LT</th><th>W</th><th>Fib618</th><th>Diverg</th><th>Analyse</th><th>Régime</th><th>Confiance</th>
 </tr></thead><tbody>{rows}</tbody></table>
 </div></body></html>"""
 
