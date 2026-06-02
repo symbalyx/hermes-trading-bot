@@ -1,0 +1,272 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>Hermes Trading Bot Dashboard</title>
+<script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.1/dist/chart.umd.min.js"></script>
+<style>
+  :root { --bg: #0f1117; --card: #1a1d28; --green: #22c55e; --red: #ef4444; --yellow: #eab308; --text: #e2e8f0; --muted: #64748b; --accent: #6366f1; }
+  * { margin: 0; padding: 0; box-sizing: border-box; }
+  body { font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif; background: var(--bg); color: var(--text); min-height: 100vh; }
+  .container { max-width: 1400px; margin: 0 auto; padding: 20px; }
+  header { display: flex; justify-content: space-between; align-items: center; padding: 16px 0; border-bottom: 1px solid #2a2d3a; margin-bottom: 24px; }
+  header h1 { font-size: 24px; font-weight: 700; }
+  header h1 span { color: var(--accent); }
+  .badge { padding: 4px 12px; border-radius: 999px; font-size: 12px; font-weight: 600; }
+  .badge.online { background: rgba(34,197,94,0.15); color: var(--green); }
+  .badge.offline { background: rgba(239,68,68,0.15); color: var(--red); }
+  .grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(220px, 1fr)); gap: 16px; margin-bottom: 24px; }
+  .card { background: var(--card); border-radius: 12px; padding: 20px; border: 1px solid #2a2d3a; }
+  .card .label { font-size: 12px; color: var(--muted); text-transform: uppercase; letter-spacing: 0.5px; margin-bottom: 8px; }
+  .card .value { font-size: 28px; font-weight: 700; }
+  .card .value.green { color: var(--green); }
+  .card .value.red { color: var(--red); }
+  .card .value.yellow { color: var(--yellow); }
+  .card .sub { font-size: 12px; color: var(--muted); margin-top: 4px; }
+  .row { display: grid; grid-template-columns: 1fr 1fr; gap: 16px; margin-bottom: 24px; }
+  @media (max-width: 768px) { .row { grid-template-columns: 1fr; } }
+  .chart-container { background: var(--card); border-radius: 12px; padding: 20px; border: 1px solid #2a2d3a; }
+  .chart-container h3 { margin-bottom: 16px; font-size: 14px; color: var(--muted); text-transform: uppercase; letter-spacing: 0.5px; }
+  .chart-container canvas { max-height: 300px; }
+  table { width: 100%; border-collapse: collapse; }
+  th { text-align: left; padding: 12px 8px; font-size: 12px; color: var(--muted); text-transform: uppercase; letter-spacing: 0.5px; border-bottom: 1px solid #2a2d3a; }
+  td { padding: 10px 8px; font-size: 14px; border-bottom: 1px solid #1e2030; }
+  .signal-buy { color: var(--green); font-weight: 600; }
+  .signal-sell { color: var(--red); font-weight: 600; }
+  .signal-neutral { color: var(--yellow); font-weight: 600; }
+  .refresh-bar { display: flex; gap: 12px; align-items: center; margin-bottom: 16px; }
+  .refresh-bar button { background: var(--accent); border: none; color: white; padding: 8px 20px; border-radius: 8px; cursor: pointer; font-weight: 600; }
+  .refresh-bar button:hover { opacity: 0.85; }
+  .refresh-bar .last-update { font-size: 12px; color: var(--muted); }
+</style>
+</head>
+<body>
+<div class="container">
+  <header>
+    <h1>🤖 <span>Hermes</span> Trading Bot</h1>
+    <div>
+      <span class="badge online" id="status-badge">● ONLINE</span>
+    </div>
+  </header>
+
+  <div class="refresh-bar">
+    <button onclick="fetchAll()">🔄 Refresh Now</button>
+    <span class="last-update" id="last-update">Loading...</span>
+  </div>
+
+  <div class="grid" id="stats-grid">
+    <div class="card"><div class="label">Total Trades</div><div class="value" id="total-trades">—</div></div>
+    <div class="card"><div class="label">Open Trades</div><div class="value" id="open-trades">—</div></div>
+    <div class="card"><div class="label">Win Rate</div><div class="value" id="win-rate">—</div></div>
+    <div class="card"><div class="label">Total Profit</div><div class="value" id="total-profit">—</div></div>
+    <div class="card"><div class="label">Best Trade</div><div class="value green" id="best-trade">—</div></div>
+    <div class="card"><div class="label">Worst Trade</div><div class="value red" id="worst-trade">—</div></div>
+    <div class="card"><div class="label">Profit Factor</div><div class="value" id="profit-factor">—</div></div>
+    <div class="card"><div class="label">Avg Profit</div><div class="value" id="avg-profit">—</div></div>
+  </div>
+
+  <div class="row">
+    <div class="chart-container">
+      <h3>📈 Profit / Loss per Trade</h3>
+      <canvas id="profitChart"></canvas>
+    </div>
+    <div class="chart-container">
+      <h3>📊 Win / Loss Distribution</h3>
+      <canvas id="winLossChart"></canvas>
+    </div>
+  </div>
+
+  <div class="chart-container" style="margin-bottom:24px;">
+    <h3>💰 Account Balance Over Time</h3>
+    <canvas id="balanceChart"></canvas>
+  </div>
+
+  <div class="chart-container">
+    <h3>📋 Recent Trades</h3>
+    <div style="overflow-x:auto;">
+      <table id="trades-table">
+        <thead><tr><th>ID</th><th>Coin</th><th>Side</th><th>Amount</th><th>Open Rate</th><th>Close Rate</th><th>Profit</th><th>Status</th><th>Date</th></tr></thead>
+        <tbody id="trades-body"><tr><td colspan="9" style="text-align:center;color:var(--muted);">Loading trades...</td></tr></tbody>
+      </table>
+    </div>
+  </div>
+</div>
+
+<script>
+const API_BASE = window.location.origin;
+
+let profitChartInstance = null;
+let winLossChartInstance = null;
+let balanceChartInstance = null;
+
+async function apiFetch(endpoint) {
+  try {
+    const res = await fetch(`${API_BASE}${endpoint}`);
+    if (!res.ok) throw new Error(`HTTP ${res.status}`);
+    return await res.json();
+  } catch (e) {
+    console.error(`API ${endpoint}:`, e);
+    return null;
+  }
+}
+
+function formatCurrency(val) {
+  if (val === null || val === undefined || val === '—') return '—';
+  const n = Number(val);
+  if (isNaN(n)) return '—';
+  return n >= 0 ? `$${n.toFixed(2)}` : `-$${Math.abs(n).toFixed(2)}`;
+}
+
+function formatPercent(val) {
+  if (val === null || val === undefined || val === '—') return '—';
+  const n = Number(val);
+  if (isNaN(n)) return '—';
+  return `${(n * 100).toFixed(1)}%`;
+}
+
+async function fetchProfit() {
+  const data = await apiFetch('/api/v1/profit');
+  if (!data) return;
+  document.getElementById('total-trades').textContent = data.total_trades ?? '—';
+  document.getElementById('open-trades').textContent = data.open_trades ?? '—';
+  document.getElementById('win-rate').textContent = formatPercent(data.win_rate);
+  document.getElementById('total-profit').textContent = formatCurrency(data.total_profit);
+  document.getElementById('total-profit').className = 'value' + ((data.total_profit ?? 0) >= 0 ? ' green' : ' red');
+  document.getElementById('best-trade').textContent = formatCurrency(data.best_trade);
+  document.getElementById('worst-trade').textContent = formatCurrency(data.worst_trade);
+  document.getElementById('profit-factor').textContent = data.profit_factor === Infinity ? '∞' : (data.profit_factor ?? '—');
+  document.getElementById('avg-profit').textContent = formatCurrency(data.avg_profit);
+}
+
+async function fetchTrades() {
+  const data = await apiFetch('/api/v1/trades?limit=50');
+  if (!data || !data.trades) return;
+  const tbody = document.getElementById('trades-body');
+  tbody.innerHTML = '';
+  data.trades.slice(0, 20).forEach(t => {
+    const isOpen = t.status === 'open';
+    const profitVal = Number(t.profit ?? 0);
+    const profitClass = isOpen ? '' : (profitVal >= 0 ? 'signal-buy' : 'signal-sell');
+    const sideClass = t.side === 'long' ? 'signal-buy' : 'signal-sell';
+    const tr = document.createElement('tr');
+    tr.innerHTML = `
+      <td>#${t.id}</td>
+      <td style="font-weight:600;">${t.coin_id || t.pair || '—'}</td>
+      <td class="${sideClass}">${(t.side || 'long').toUpperCase()}</td>
+      <td>${Number(t.amount ?? 0).toFixed(4)}</td>
+      <td>$${Number(t.rate ?? 0).toFixed(4)}</td>
+      <td>${t.close_rate ? '$' + Number(t.close_rate).toFixed(4) : '—'}</td>
+      <td class="${profitClass}">${isOpen ? '—' : formatCurrency(t.profit)}</td>
+      <td><span class="badge ${isOpen ? 'online' : 'offline'}">${isOpen ? 'OPEN' : 'CLOSED'}</span></td>
+      <td style="font-size:12px;color:var(--muted);">${(t.open_date || '').slice(0, 10)}</td>
+    `;
+    tbody.appendChild(tr);
+  });
+}
+
+async function fetchPerformance() {
+  const data = await apiFetch('/api/v1/performance');
+  if (!data || !data.performance) return;
+
+  const perf = data.performance.reverse();
+  const labels = perf.map(p => p.date || '');
+
+  // Profit chart
+  const profits = perf.map(p => Number(p.total_profit ?? 0));
+  const profitCtx = document.getElementById('profitChart').getContext('2d');
+  if (profitChartInstance) profitChartInstance.destroy();
+  profitChartInstance = new Chart(profitCtx, {
+    type: 'bar',
+    data: {
+      labels,
+      datasets: [{
+        label: 'Daily Profit ($)',
+        data: profits,
+        backgroundColor: profits.map(v => v >= 0 ? 'rgba(34,197,94,0.6)' : 'rgba(239,68,68,0.6)'),
+        borderColor: profits.map(v => v >= 0 ? '#22c55e' : '#ef4444'),
+        borderWidth: 1,
+      }]
+    },
+    options: {
+      responsive: true,
+      maintainAspectRatio: false,
+      plugins: { legend: { labels: { color: '#e2e8f0' } } },
+      scales: { x: { ticks: { color: '#64748b', maxTicksLimit: 10 } }, y: { ticks: { color: '#64748b' } } }
+    }
+  });
+
+  // Win/Loss pie chart
+  const winLossCtx = document.getElementById('winLossChart').getContext('2d');
+  const lastPerf = perf[perf.length - 1] || {};
+  const wins = Number(lastPerf.winning_trades ?? 0);
+  const losses = Number(lastPerf.losing_trades ?? 0);
+  if (winLossChartInstance) winLossChartInstance.destroy();
+  winLossChartInstance = new Chart(winLossCtx, {
+    type: 'doughnut',
+    data: {
+      labels: ['Wins', 'Losses'],
+      datasets: [{
+        data: [Math.max(wins, 1), Math.max(losses, 1)],
+        backgroundColor: ['rgba(34,197,94,0.7)', 'rgba(239,68,68,0.7)'],
+        borderColor: ['#22c55e', '#ef4444'],
+        borderWidth: 2,
+      }]
+    },
+    options: {
+      responsive: true,
+      maintainAspectRatio: false,
+      plugins: { legend: { position: 'bottom', labels: { color: '#e2e8f0' } } }
+    }
+  });
+
+  // Balance chart
+  const balances = perf.map(p => Number(p.balance ?? 0));
+  const balanceCtx = document.getElementById('balanceChart').getContext('2d');
+  if (balanceChartInstance) balanceChartInstance.destroy();
+  balanceChartInstance = new Chart(balanceCtx, {
+    type: 'line',
+    data: {
+      labels,
+      datasets: [{
+        label: 'Balance ($)',
+        data: balances,
+        borderColor: '#6366f1',
+        backgroundColor: 'rgba(99,102,241,0.1)',
+        fill: true,
+        tension: 0.3,
+        pointRadius: 3,
+      }]
+    },
+    options: {
+      responsive: true,
+      maintainAspectRatio: false,
+      plugins: { legend: { labels: { color: '#e2e8f0' } } },
+      scales: { x: { ticks: { color: '#64748b', maxTicksLimit: 15 } }, y: { ticks: { color: '#64748b' } } }
+    }
+  });
+}
+
+async function fetchStatus() {
+  const data = await apiFetch('/api/v1/status');
+  if (!data) {
+    document.getElementById('status-badge').className = 'badge offline';
+    document.getElementById('status-badge').textContent = '● OFFLINE';
+    return;
+  }
+  document.getElementById('status-badge').className = 'badge online';
+  document.getElementById('status-badge').textContent = '● ONLINE';
+}
+
+async function fetchAll() {
+  const now = new Date().toLocaleTimeString();
+  document.getElementById('last-update').textContent = `Last updated: ${now}`;
+  await Promise.all([fetchStatus(), fetchProfit(), fetchTrades(), fetchPerformance()]);
+}
+
+// Auto-refresh every 60 seconds
+fetchAll();
+setInterval(fetchAll, 60000);
+</script>
+</body>
+</html>
