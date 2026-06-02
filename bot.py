@@ -90,8 +90,9 @@ def calc_macd(prices):
         return {"macd": None, "signal": None, "histogram": None}
     ema12 = calc_ema(prices, 12)
     ema26 = calc_ema(prices, 26)
-    macd_line = ema12[-1] - ema26[-1]
-    signal = calc_ema_values(macd_line, 9) if len(prices) > 35 else None
+    macd_values = [ema12[i] - ema26[i] for i in range(len(ema12))]
+    macd_line = macd_values[-1]
+    signal = calc_ema_values(macd_values, 9)
     hist = macd_line - signal if signal else None
     return {"macd": round(macd_line, 2), "signal": round(signal, 2) if signal else None, "histogram": round(hist, 2) if hist else None}
 
@@ -105,7 +106,7 @@ def calc_ema(prices, period):
 
 def calc_ema_values(values, period):
     """Calcul EMA sur une serie de valeurs"""
-    if len(values) < period:
+    if not isinstance(values, (list, tuple)) or len(values) < period:
         return None
     multiplier = 2 / (period + 1)
     ema = values[-period]
