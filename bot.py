@@ -1,34 +1,58 @@
 #!/usr/bin/env python3
 """
-Hermes Trading Bot v2 — analyse marché crypto avancée
-Inspiré de Freqtrade, qtpylib, Jesse
-Indicateurs: RSI, MACD, SMA/EMA, Bollinger Bands, ADX, Stochastique,
-             MFI, ATR, Heikin Ashi, Support/Resistance, Volume Profile
-Signaux: système de score multicritères avec pondération
+Hermes Trading Bot v3 — IA de raisonnement pour le trading crypto.
+Combinaison d'analyse technique avancee, Machine Learning et raisonnement LLM.
+
+Fonctionnalites:
+  - Analyse technique complete (RSI, MACD, BB, ADX, Stoch, MFI, ATR, Heikin Ashi)
+  - Machine Learning (RandomForest, LinearRegression) pour predictions
+  - Raisonnement IA via Ollama (qwen2.5:3b) — analyse narrative
+  - Divergences RSI/prix (bullish/bearish)
+  - Retracements Fibonacci avec zones de liquidite
+  - Backtesting de strategies
+  - Matrice de correlation entre actifs
+  - Allocations de portefeuille recommandees
+  - Rapport narratif complet style ChatGPT
 
 Usage:
-  python3 bot.py                    # Analyse BTC, ETH
-  python3 bot.py --coin all         # Top 20 coins
-  python3 bot.py --coin solana --days 90
-  python3 bot.py --html             # Rapport HTML
-  python3 bot.py --loop 60          # Boucle toutes les 60min
+  python3 bot.py                           # Analyse BTC, ETH
+  python3 bot.py --coin all                # Top 20 coins
+  python3 bot.py --coin solana --llm       # Avec raisonnement IA
+  python3 bot.py --backtest                # Backtest strategie
+  python3 bot.py --loop 60 --llm           # Boucle toutes les 60min
 """
 import json, time, sys, os, argparse, math
-from datetime import datetime
+from datetime import datetime, timedelta
 from pathlib import Path
+from typing import Optional
 
 import numpy as np
 import pandas as pd
 import requests
 
-# ─── Configuration ───────────────────────────────────────────────────
+# ─── ML ──────────────────────────────────────────────────────────
+try:
+    from sklearn.ensemble import RandomForestRegressor
+    from sklearn.linear_model import LinearRegression
+    from sklearn.preprocessing import StandardScaler
+    from sklearn.metrics import mean_absolute_error, r2_score
+    ML_OK = True
+except ImportError:
+    ML_OK = False
+
+# ─── Configuration ───────────────────────────────────────────────
 COINGECKO_BASE = "https://api.coingecko.com/api/v3"
+OLLAMA_BASE = "http://localhost:11434"
+LLM_MODEL = "qwen2.5:3b"
 DATA_DIR = Path(__file__).parent / "data"
 DATA_DIR.mkdir(exist_ok=True)
 HISTORY_DIR = DATA_DIR / "history"
 HISTORY_DIR.mkdir(exist_ok=True)
+CACHE_DIR = DATA_DIR / "cache"
+CACHE_DIR.mkdir(exist_ok=True)
 
-REQUEST_DELAY = 6.0  # secondes entre requetes (rate limit CoinGecko: 10-30/min)
+REQUEST_DELAY = 5.0
+CACHE_TTL = 300  # 5 min
 
 TOP_50 = [
     "bitcoin","ethereum","ripple","cardano","solana","polkadot","dogecoin",
@@ -40,582 +64,778 @@ TOP_50 = [
     "curve-dao-token","zcash","quant","bitget-token","dydx","pyth-network"
 ]
 
-# Ponderation des indicateurs pour le signal final
-WEIGHTS = {
-    "rsi": 2.0,
-    "macd": 2.0,
-    "bbands": 1.5,
-    "adx": 1.0,
-    "stoch": 1.0,
-    "mfi": 1.0,
-    "ema_trend": 1.5,
-    "volume": 1.0,
-    "heikin_ashi": 1.0,
-}
+# ─── LLM Client ──────────────────────────────────────────────────
 
-# ─── Data fetching ─────────────────────────────────────────────────
+class LLMAnalyzer:
+    """Analyse narrative via Ollama (raisonnement IA)"""
 
-def api_get(url, retries=3):
-    """Requete API avec retry et rate limit"""
-    for attempt in range(retries):
+    def __init__(self, model=LLM_MODEL):
+        self.model = model
+        self.available = self._check()
+
+    def _check(self):
         try:
-            r = requests.get(url, timeout=30)
-            if r.status_code == 429:
-                wait = 30 * (attempt + 1)
-                print(f"  ⏳ Rate limited, attente {wait}s...")
-                time.sleep(wait)
-                continue
-            r.raise_for_status()
-            return r.json()
-        except requests.exceptions.RequestException as e:
-            if attempt == retries - 1:
-                raise
-            time.sleep(5 * (attempt + 1))
-    return {}
+            r = requests.get(f"{OLLAMA_BASE}/api/tags", timeout=5)
+            return r.status_code == 200
+        except:
+            return False
 
-def fetch_market_data(coin_id, days=60):
-    """Recupere prix + volumes depuis CoinGecko (endpoint fiable)"""
-    # CoinGecko free API: 10-30 req/min. market_chart est le plus stable.
-    url = f"{COINGECKO_BASE}/coins/{coin_id}/market_chart?vs_currency=usd&days={days}"
-    data = api_get(url)
-    if not data or "prices" not in data or not data["prices"]:
-        return pd.DataFrame()
+    def analyze(self, prompt: str, system: str = "") -> Optional[str]:
+        if not self.available:
+            return None
+        try:
+            payload = {
+                "model": self.model,
+                "prompt": prompt,
+                "system": system or "Tu es un analyste financier expert en crypto-monnaies. Reponds en francais de facon concise et professionnelle, sans emoji, sans markdown.",
+                "stream": False,
+                "options": {"temperature": 0.3, "num_predict": 1024}
+            }
+            r = requests.post(f"{OLLAMA_BASE}/api/generate", json=payload, timeout=120)
+            if r.status_code == 200:
+                return r.json().get("response", "").strip()
+            return None
+        except Exception as e:
+            return None
 
-    prices = pd.DataFrame(data["prices"], columns=["timestamp", "close"])
-    volumes = pd.DataFrame(data.get("total_volumes", []), columns=["timestamp", "volume"])
+    def market_analysis(self, summary: dict, top_buys: list, top_sells: list, context: str = "") -> str:
+        """Analyse narrative complete du marche"""
+        prompt = f"""Analyse le marche crypto suivant et donne ton verdict argumente :
 
-    df = prices.merge(volumes, on="timestamp", how="left")
-    df["timestamp"] = pd.to_datetime(df["timestamp"], unit="ms")
-    df.set_index("timestamp", inplace=True)
+RESUME DU MARCHE:
+- Actifs analyses: {summary.get('total', 0)}
+- Signaux ACHAT: {summary.get('achat', 0)} ({summary.get('achat_fort', 0)} forts)
+- Signaux VENTE: {summary.get('vente', 0)} ({summary.get('vente_fort', 0)} forts)
+- Meilleur score: {summary.get('best_score', 0):+.2f}
+- Pire score: {summary.get('worst_score', 0):+.2f}
 
-    # Synthetise OHLC a partir des close prices
-    df["open"] = df["close"].shift(1)
-    df.loc[df.index[0], "open"] = df["close"].iloc[0]
-    df["high"] = df["close"].rolling(3, min_periods=1).max()
-    df["low"] = df["close"].rolling(3, min_periods=1).min()
+TOP ACHATS:
+{chr(10).join([f'{r["name"]}: ${r["price"]:,.2f} score={r["normalized_score"]:+.2f} RSI={r["indicators"].get("rsi","N/A")} MACDh={r["indicators"].get("macd_hist","N/A"):+.2f}' for r in top_buys[:5]]) if top_buys else 'Aucun'}
 
-    # Resample quotidien pour avoir des bougies propres
-    ohlc_dict = {
-        "open": "first",
-        "high": "max",
-        "low": "min",
-        "close": "last",
-        "volume": "sum",
-    }
-    if len(df) > 48:  # Plus d'un jour de donnees
-        df = df.resample("1D").agg(ohlc_dict).dropna()
+TOP VENTES:
+{chr(10).join([f'{r["name"]}: ${r["price"]:,.2f} score={r["normalized_score"]:+.2f} RSI={r["indicators"].get("rsi","N/A")} MACDh={r["indicators"].get("macd_hist","N/A"):+.2f}' for r in top_sells[:3]]) if top_sells else 'Aucun'}
 
-    return df
+{context}
 
-def fetch_coin_info(coin_id):
-    """Infos supplementaires"""
-    url = f"{COINGECKO_BASE}/coins/{coin_id}?localization=false&tickers=false&community_data=false&developer_data=false"
-    return api_get(url)
+Donne :
+1. Tendance generale du marche
+2. Opportunites identifiees (avec justifications)
+3. Risques et points d'attention
+4. Recommandation actionnable"""
+        return self.analyze(prompt)
 
-# ─── Indicateurs techniques ──────────────────────────────────────────
+    def coin_analysis(self, coin_name: str, metrics: dict, reasons: list) -> str:
+        """Analyse narrative d'un coin specifique"""
+        prompt = f"""Analyse cet actif et donne ton avis d'expert:
 
-def crossed_above(series1, series2):
-    """Detection de croisement haussier"""
-    if isinstance(series2, (int, float)):
-        series2_val = series2
-        return (series1 > series2_val) & (series1.shift(1) <= series2_val)
-    return (series1 > series2) & (series1.shift(1) <= series2.shift(1))
+ACTIF: {coin_name}
+Prix: ${metrics.get('price', 0):,.2f}
+Variation 24h: {metrics.get('change_24h', 0):+.2f}%
+Signal: {metrics.get('signal', 'N/A')}
+Score: {metrics.get('normalized_score', 0):+.2f}
 
-def crossed_below(series1, series2):
-    """Detection de croisement baissier"""
-    if isinstance(series2, (int, float)):
-        series2_val = series2
-        return (series1 < series2_val) & (series1.shift(1) >= series2_val)
-    return (series1 < series2) & (series1.shift(1) >= series2.shift(1))
+INDICATEURS TECHNIQUES:
+{chr(10).join([f'- {k}: {v}' for k, v in metrics.get('indicators', {}).items() if v is not None])[:500]}
 
-def calc_rsi(series, period=14):
-    """RSI - Relative Strength Index"""
-    delta = series.diff()
-    gain = delta.where(delta > 0, 0.0)
-    loss = (-delta.where(delta < 0, 0.0))
-    avg_gain = gain.rolling(period, min_periods=period).mean()
-    avg_loss = loss.rolling(period, min_periods=period).mean()
-    rs = avg_gain / avg_loss.replace(0, np.nan)
-    rsi = 100 - (100 / (1 + rs))
-    return rsi
+RAISONS DU SIGNAL:
+{chr(10).join([f'- {r}' for r in reasons[:8]])}
 
-def calc_ema(series, period):
-    """Exponential Moving Average"""
-    return series.ewm(span=period, adjust=False).mean()
+Question: Quel est ton verdict sur {coin_name} ? Explique la situation technique, le contexte de marche, et donne une recommandation claire (ACHAT/NEUTRE/VENTE) avec un niveau de confiance."""
+        return self.analyze(prompt)
 
-def calc_sma(series, period):
-    """Simple Moving Average"""
-    return series.rolling(period, min_periods=period).mean()
+    def portfolio_recommendation(self, coins: list, budget: float = 10000) -> str:
+        """Recommandation de portefeuille"""
+        entries = []
+        for c in coins[:10]:
+            score = c.get("normalized_score", 0)
+            sig = c.get("signal", "NEUTRE")
+            entries.append(f"- {c['name']}: signal={sig} score={score:+.2f} price=${c.get('price',0):,.2f}")
+        prompt = f"""Propose une allocation de portefeuille de ${budget:,.0f} basee sur ces analyses:
 
-def calc_macd(series, fast=12, slow=26, signal=9):
-    """MACD - Moving Average Convergence Divergence"""
-    ema_fast = calc_ema(series, fast)
-    ema_slow = calc_ema(series, slow)
-    macd_line = ema_fast - ema_slow
-    signal_line = calc_ema(macd_line, signal)
-    histogram = macd_line - signal_line
-    return macd_line, signal_line, histogram
+{chr(10).join(entries)}
 
-def calc_bollinger_bands(series, window=20, std_dev=2):
-    """Bollinger Bands"""
-    sma = calc_sma(series, window)
-    std = series.rolling(window, min_periods=window).std()
-    upper = sma + std * std_dev
-    lower = sma - std * std_dev
-    bb_percent = (series - lower) / (upper - lower)
-    bb_width = (upper - lower) / sma
-    return upper, sma, lower, bb_percent, bb_width
+Donne pour chaque actif: allocation (%), prix d'entree conseille, stop-loss, take-profit, et justification."""
+        return self.analyze(prompt)
 
-def calc_adx(df, period=14):
-    """ADX - Average Directional Index (force de tendance)"""
-    high, low, close = df["high"].values, df["low"].values, df["close"].values
 
-    plus_dm = np.zeros_like(close)
-    minus_dm = np.zeros_like(close)
-    tr = np.zeros_like(close)
+# ─── Data fetching ───────────────────────────────────────────────
 
-    for i in range(1, len(close)):
-        up_move = high[i] - high[i-1]
-        down_move = low[i-1] - low[i]
-        if up_move > down_move and up_move > 0:
-            plus_dm[i] = up_move
-        else:
-            minus_dm[i] = down_move if down_move > 0 else 0
-        tr[i] = max(high[i] - low[i], abs(high[i] - close[i-1]), abs(low[i] - close[i-1]))
+class DataFetcher:
+    """Gestion optimisee des donnees avec cache"""
 
-    atr = pd.Series(tr).rolling(period).mean().values
-    plus_di = 100 * pd.Series(plus_dm).rolling(period).mean().values / atr
-    minus_di = 100 * pd.Series(minus_dm).rolling(period).mean().values / atr
-    dx = 100 * abs(plus_di - minus_di) / (plus_di + minus_di)
-    adx = pd.Series(dx).rolling(period).mean()
+    def __init__(self):
+        self.last_request = 0
 
-    return adx, pd.Series(plus_di), pd.Series(minus_di), pd.Series(atr)
+    def _throttle(self):
+        elapsed = time.time() - self.last_request
+        if elapsed < REQUEST_DELAY:
+            time.sleep(REQUEST_DELAY - elapsed)
+        self.last_request = time.time()
 
-def calc_stoch(high, low, close, k_period=14, d_period=3):
-    """Stochastic Oscillator %K et %D"""
-    low_min = low.rolling(k_period).min()
-    high_max = high.rolling(k_period).max()
-    k = 100 * (close - low_min) / (high_max - low_min + 1e-10)
-    d = k.rolling(d_period).mean()
-    return k, d
+    def _cached_get(self, cache_key: str, url: str, ttl: int = CACHE_TTL):
+        cache_path = CACHE_DIR / f"{cache_key}.json"
+        if cache_path.exists():
+            age = time.time() - cache_path.stat().st_mtime
+            if age < ttl:
+                with open(cache_path) as f:
+                    return json.load(f)
+        # Si age > TTL, on rafraichit (mais pas si < 30s pour eviter spam)
+        if age < 30 if cache_path.exists() else False:
+            return json.load(open(cache_path))
 
-def calc_mfi(df, period=14):
-    """MFI - Money Flow Index"""
-    typical = (df["high"] + df["low"] + df["close"]) / 3
-    money_flow = typical * df.get("volume", pd.Series(1, index=df.index))
-    sign = (typical.diff() >= 0).astype(int) * 2 - 1  # 1 pour up, -1 pour down
-
-    pos_flow = money_flow.where(sign > 0, 0).rolling(period).sum()
-    neg_flow = money_flow.where(sign < 0, 0).rolling(period).sum()
-    mfr = pos_flow / neg_flow.replace(0, 1e-10)
-    mfi = 100 - (100 / (1 + mfr))
-    return mfi
-
-def calc_heikin_ashi(df):
-    """Heikin Ashi candles"""
-    ha = df.copy()
-    ha["ha_close"] = (df["open"] + df["high"] + df["low"] + df["close"]) / 4
-    ha["ha_open"] = ((df["open"] + df["close"]) / 2).shift(1).bfill()
-    ha["ha_high"] = ha[["high", "ha_open", "ha_close"]].max(axis=1)
-    ha["ha_low"] = ha[["low", "ha_open", "ha_close"]].min(axis=1)
-    ha["ha_trend"] = np.where(ha["ha_close"] > ha["ha_open"], 1, -1)
-    return ha
-
-def calc_atr(df, period=14):
-    """ATR - Average True Range"""
-    high, low, close = df["high"], df["low"], df["close"]
-    tr = pd.concat([
-        high - low,
-        (high - close.shift()).abs(),
-        (low - close.shift()).abs()
-    ], axis=1).max(axis=1)
-    return tr.rolling(period).mean()
-
-def calc_volume_profile(prices, volumes, num_zones=5):
-    """Volume profile - prix les plus negociés"""
-    if len(prices) < 10 or len(volumes) < 10:
+        self._throttle()
+        for attempt in range(3):
+            try:
+                r = requests.get(url, timeout=30)
+                if r.status_code == 429:
+                    wait = 30 * (attempt + 1)
+                    time.sleep(wait)
+                    continue
+                r.raise_for_status()
+                data = r.json()
+                with open(cache_path, "w") as f:
+                    json.dump(data, f)
+                return data
+            except Exception as e:
+                if cache_path.exists():
+                    # Fallback au cache si echec
+                    with open(cache_path) as f:
+                        return json.load(f)
+                if attempt == 2:
+                    raise
+                time.sleep(5 * (attempt + 1))
         return {}
-    price_min, price_max = min(prices), max(prices)
-    zone_size = (price_max - price_min) / num_zones
-    zones = {}
-    for i in range(num_zones):
-        lo = price_min + i * zone_size
-        hi = lo + zone_size
-        mask = (prices >= lo) & (prices < hi)
-        vol = volumes[mask].sum() if volumes[mask].any() else 0
-        zone_label = f"{lo:.4f}-{hi:.4f}"
-        zones[zone_label] = float(vol)
-    return zones
 
-# ─── Analyse ─────────────────────────────────────────────────────────
+    def fetch_market_data(self, coin_id: str, days: int = 90):
+        """Donnees marche avec OHLCV synthetique"""
+        url = f"{COINGECKO_BASE}/coins/{coin_id}/market_chart?vs_currency=usd&days={days}"
+        data = self._cached_get(f"market_{coin_id}_{days}", url)
+        if not data or "prices" not in data or not data["prices"]:
+            return pd.DataFrame()
 
-class CoinAnalysis:
-    """Analyse complete d'une crypto"""
+        prices = pd.DataFrame(data["prices"], columns=["timestamp", "close"])
+        volumes = pd.DataFrame(data.get("total_volumes", []), columns=["timestamp", "volume"])
+        df = prices.merge(volumes, on="timestamp", how="left")
+        df["timestamp"] = pd.to_datetime(df["timestamp"], unit="ms")
+        df.set_index("timestamp", inplace=True)
 
-    def __init__(self, coin_id, ohlc_df, price_df):
+        # OHLC synthetique
+        df["open"] = df["close"].shift(1)
+        df.loc[df.index[0], "open"] = df["close"].iloc[0]
+        df["high"] = df["close"].rolling(5, min_periods=1).max()
+        df["low"] = df["close"].rolling(5, min_periods=1).min()
+
+        # Resample quotidien
+        if len(df) > 48:
+            ohlc_dict = {"open": "first", "high": "max", "low": "min",
+                        "close": "last", "volume": "sum"}
+            df = df.resample("1D").agg(ohlc_dict).dropna()
+
+        return df
+
+    def fetch_coins_list(self):
+        """Liste de tous les coins avec market cap"""
+        url = f"{COINGECKO_BASE}/coins/markets?vs_currency=usd&order=market_cap_desc&per_page=50&page=1"
+        return self._cached_get("coins_markets", url, ttl=600)
+
+    def fetch_trending(self):
+        """Coins tendances"""
+        url = f"{COINGECKO_BASE}/search/trending"
+        return self._cached_get("trending", url, ttl=900)
+
+    def fetch_global_data(self):
+        """Donnees globales du marche"""
+        url = f"{COINGECKO_BASE}/global"
+        return self._cached_get("global", url, ttl=600)
+
+    def fetch_coin_info(self, coin_id: str):
+        """Infos detaillees d'un coin"""
+        url = f"{COINGECKO_BASE}/coins/{coin_id}?localization=false&tickers=false&community_data=false&developer_data=false"
+        return self._cached_get(f"info_{coin_id}", url, ttl=3600)
+
+
+# ─── Indicateurs techniques ──────────────────────────────────────
+
+class Indicators:
+    """Calcul de tous les indicateurs techniques"""
+
+    @staticmethod
+    def crossed_above(s1, s2):
+        if isinstance(s2, (int, float)):
+            return (s1 > s2) & (s1.shift(1) <= s2)
+        return (s1 > s2) & (s1.shift(1) <= s2.shift(1))
+
+    @staticmethod
+    def crossed_below(s1, s2):
+        if isinstance(s2, (int, float)):
+            return (s1 < s2) & (s1.shift(1) >= s2)
+        return (s1 < s2) & (s1.shift(1) >= s2.shift(1))
+
+    @staticmethod
+    def rsi(series, period=14):
+        delta = series.diff()
+        gain = delta.where(delta > 0, 0.0)
+        loss = (-delta.where(delta < 0, 0.0))
+        avg_g = gain.rolling(period, min_periods=period).mean()
+        avg_l = loss.rolling(period, min_periods=period).mean()
+        rs = avg_g / avg_l.replace(0, np.nan)
+        return 100 - (100 / (1 + rs))
+
+    @staticmethod
+    def ema(series, period):
+        return series.ewm(span=period, adjust=False).mean()
+
+    @staticmethod
+    def sma(series, period):
+        return series.rolling(period, min_periods=period).mean()
+
+    @staticmethod
+    def macd(series, fast=12, slow=26, signal=9):
+        ef = Indicators.ema(series, fast)
+        es = Indicators.ema(series, slow)
+        line = ef - es
+        sig = Indicators.ema(line, signal)
+        hist = line - sig
+        return line, sig, hist
+
+    @staticmethod
+    def bollinger(series, window=20, std=2):
+        mid = Indicators.sma(series, window)
+        sd = series.rolling(window, min_periods=window).std()
+        upper = mid + sd * std
+        lower = mid - sd * std
+        pct = (series - lower) / (upper - lower)
+        width = (upper - lower) / mid
+        return upper, mid, lower, pct, width
+
+    @staticmethod
+    def adx(df, period=14):
+        h, l, c = df["high"].values, df["low"].values, df["close"].values
+        pdm = np.zeros_like(c)
+        ndm = np.zeros_like(c)
+        tr = np.zeros_like(c)
+        for i in range(1, len(c)):
+            up = h[i] - h[i-1]
+            dn = l[i-1] - l[i]
+            pdm[i] = up if up > dn and up > 0 else 0
+            ndm[i] = dn if dn > up and dn > 0 else 0
+            tr[i] = max(h[i]-l[i], abs(h[i]-c[i-1]), abs(l[i]-c[i-1]))
+        atr = pd.Series(tr).rolling(period).mean().values
+        pdi = 100 * pd.Series(pdm).rolling(period).mean().values / np.maximum(atr, 1e-10)
+        ndi = 100 * pd.Series(ndm).rolling(period).mean().values / np.maximum(atr, 1e-10)
+        dx = 100 * abs(pdi - ndi) / np.maximum(pdi + ndi, 1e-10)
+        return pd.Series(dx).rolling(period).mean(), pd.Series(pdi), pd.Series(ndi), pd.Series(atr)
+
+    @staticmethod
+    def stoch(high, low, close, k=14, d=3):
+        ll = low.rolling(k).min()
+        hh = high.rolling(k).max()
+        kline = 100 * (close - ll) / (hh - ll + 1e-10)
+        dline = kline.rolling(d).mean()
+        return kline, dline
+
+    @staticmethod
+    def mfi(df, period=14):
+        typical = (df["high"] + df["low"] + df["close"]) / 3
+        mf = typical * df.get("volume", pd.Series(1, index=df.index))
+        sign = (typical.diff() >= 0).astype(int) * 2 - 1
+        pos = mf.where(sign > 0, 0).rolling(period).sum()
+        neg = mf.where(sign < 0, 0).rolling(period).sum()
+        ratio = pos / np.maximum(neg, 1e-10)
+        return 100 - (100 / (1 + ratio))
+
+    @staticmethod
+    def heikin_ashi(df):
+        ha = df.copy()
+        ha["ha_close"] = (df["open"] + df["high"] + df["low"] + df["close"]) / 4
+        ha["ha_open"] = ((df["open"] + df["close"]) / 2).shift(1).bfill()
+        ha["ha_high"] = ha[["high", "ha_open", "ha_close"]].max(axis=1)
+        ha["ha_low"] = ha[["low", "ha_open", "ha_close"]].min(axis=1)
+        ha["ha_trend"] = np.where(ha["ha_close"] > ha["ha_open"], 1, -1)
+        # Comptage streak
+        trend_vals = ha["ha_trend"].values
+        streak, cnt = 0, 0
+        for i in range(len(trend_vals)-1, -1, -1):
+            if trend_vals[i] == ha["ha_trend"].iloc[-1]:
+                cnt += 1
+            else:
+                break
+        ha["ha_streak"] = cnt
+        return ha
+
+    @staticmethod
+    def atr(df, period=14):
+        h, l, c = df["high"], df["low"], df["close"]
+        tr = pd.concat([h-l, (h-c.shift()).abs(), (l-c.shift()).abs()], axis=1).max(axis=1)
+        return tr.rolling(period).mean()
+
+    @staticmethod
+    def fib_retracement(high, low):
+        """Niveaux Fibonacci pour une tendance"""
+        diff = high - low
+        return {
+            "0.0": high,
+            "0.236": high - diff * 0.236,
+            "0.382": high - diff * 0.382,
+            "0.5": high - diff * 0.5,
+            "0.618": high - diff * 0.618,
+            "0.786": high - diff * 0.786,
+            "1.0": low,
+        }
+
+    @staticmethod
+    def find_divergence(price, rsi, window=14):
+        """Detecte divergences haussieres/baissieres"""
+        divergences = []
+        for i in range(window, len(price)-1):
+            # Double bottom (haussiere)
+            if (price[i] < price[i-window] and rsi[i] > rsi[i-window] and
+                price[i] < price[i-1] and price[i] < price[i+1]):
+                divergences.append({"type": "bullish", "index": i, "price": float(price[i]), "rsi": float(rsi[i])})
+            # Double top (baissiere)
+            if (price[i] > price[i-window] and rsi[i] < rsi[i-window] and
+                price[i] > price[i-1] and price[i] > price[i+1]):
+                divergences.append({"type": "bearish", "index": i, "price": float(price[i]), "rsi": float(rsi[i])})
+        return divergences[-5:] if divergences else []
+
+    @staticmethod
+    def support_resistance(high, low, n_levels=5):
+        """Niveaux de support/resistance par clustering"""
+        all_levels = np.concatenate([high.values, low.values])
+        if len(all_levels) < n_levels:
+            return {"support": float(min(all_levels)), "resistance": float(max(all_levels))}
+        # KMeans-like simple: diviser en n buckets
+        sorted_vals = np.sort(all_levels)
+        bucket_size = len(sorted_vals) // n_levels
+        levels = {}
+        for i in range(n_levels):
+            bucket = sorted_vals[i*bucket_size:(i+1)*bucket_size]
+            levels[f"niveau_{i+1}"] = float(np.mean(bucket))
+        return {"support": min(levels.values()), "resistance": max(levels.values()), **levels}
+
+
+# ─── Machine Learning ────────────────────────────────────────────
+
+class MLPredictor:
+    """Predictions ML pour les tendances de prix"""
+
+    def __init__(self):
+        self.ready = ML_OK
+
+    def prepare_features(self, df: pd.DataFrame) -> tuple:
+        """Cree les features pour le ML"""
+        close = df["close"].values
+        volume = df.get("volume", pd.Series(1, index=df.index)).values
+
+        features = []
+        targets = []
+        n = len(close)
+
+        for i in range(20, n - 5):
+            feat = [
+                close[i] / close[i-1] - 1,            # rendement j-1
+                close[i] / close[i-5] - 1,            # rendement j-5
+                close[i] / close[i-10] - 1,           # rendement j-10
+                close[i] / close[i-20] - 1,           # rendement j-20
+                volume[i] / (np.mean(volume[i-5:i]) + 1e-10),  # ratio vol
+                np.std(close[i-5:i]) / close[i],      # volatilite 5j
+                np.std(close[i-10:i]) / close[i],     # volatilite 10j
+                np.mean(close[i-5:i]) / close[i] - 1, # distance EMA5
+                np.mean(close[i-10:i]) / close[i] - 1, # distance EMA10
+                close[i] / np.max(close[i-20:i]) - 1, # distance au max 20j
+                close[i] / np.min(close[i-20:i]) - 1, # distance au min 20j
+                max(close[i-5:i]) / min(close[i-5:i]) - 1, # range 5j
+            ]
+            features.append(feat)
+
+            # Target: rendement moyen sur les 5 prochains jours
+            target = close[i+5] / close[i] - 1 if i+5 < n else 0
+            targets.append(target)
+
+        return np.array(features), np.array(targets)
+
+    def predict(self, df: pd.DataFrame) -> dict:
+        """Prediction ML de la tendance — version amelioree"""
+        if not self.ready or len(df) < 60:
+            return {"error": "ML non disponible ou donnees insuffisantes"}
+
+        try:
+            X, y = self.prepare_features(df)
+            if len(X) < 20:
+                return {"error": "echantillon insuffisant"}
+
+            # Utiliser les 80% recents pour train, 20% pour test
+            split = max(int(len(X) * 0.8), len(X) - 20)
+            X_train, X_test = X[:split], X[split:]
+            y_train, y_test = y[:split], y[split:]
+
+            if len(X_test) < 3:
+                X_train, X_test = X[:-3], X[-3:]
+                y_train, y_test = y[:-3], y[-3:]
+
+            # Standardiser
+            scaler = StandardScaler()
+            X_train_s = scaler.fit_transform(X_train)
+            X_test_s = scaler.transform(X_test)
+
+            # 1) Linear Regression (robuste pour petits echantillons)
+            lr = LinearRegression()
+            lr.fit(X_train_s, y_train)
+            lr_pred_test = lr.predict(X_test_s)
+            lr_mae = mean_absolute_error(y_test, lr_pred_test)
+            lr_r2 = r2_score(y_test, lr_pred_test)
+
+            # 2) Random Forest (si assez d'echantillons)
+            rf = None; rf_mae = None; rf_r2 = None; rf_pred = None
+            if len(X_train) >= 30:
+                rf = RandomForestRegressor(n_estimators=50, max_depth=4, random_state=42, n_jobs=1)
+                rf.fit(X_train_s, y_train)
+                rf_pred_test = rf.predict(X_test_s)
+                rf_mae = mean_absolute_error(y_test, rf_pred_test)
+                rf_r2 = r2_score(y_test, rf_pred_test)
+                rf_pred = float(rf.predict(scaler.transform(X[-1:].reshape(1, -1)))[0])
+
+            # Prediction future
+            lr_future = float(lr.predict(scaler.transform(X[-1:].reshape(1, -1)))[0])
+
+            # Best model selection
+            if rf is not None and rf_r2 is not None and rf_r2 > lr_r2:
+                best_pred = rf_pred
+                best_model = "rf"
+                mae = rf_mae
+            else:
+                best_pred = lr_future
+                best_model = "lr"
+                mae = lr_mae
+
+            # Calculer la volatilite historique comme base de comparaison
+            hist_vol = np.std(y_train) * 100
+
+            # Confiance basee sur la qualite du fit
+            best_r2 = max(rf_r2 or -10, lr_r2)
+            conf = "haute" if best_r2 > 0.3 else "moyenne" if best_r2 > 0.05 else "faible"
+            accuracy = max(0, min(100, max(0, (1 - abs(mae) / max(hist_vol, 0.01))) * 100))
+
+            # Tendances ML
+            bf_pct = best_pred * 100
+            trend = "HAUSSIER" if bf_pct > 1.5 else "BAISSIER" if bf_pct < -1.5 else "NEUTRE"
+
+            return {
+                "prediction_5d": round(bf_pct, 2),
+                "model": best_model,
+                "r2_score": round(float(best_r2), 3),
+                "mae": round(float(mae * 100), 2),
+                "accuracy_pct": round(accuracy, 1),
+                "confidence": conf,
+                "trend": trend,
+                "training_samples": len(X_train),
+                "hist_volatility": round(float(hist_vol), 2),
+                "rf_r2": round(float(rf_r2), 3) if rf_r2 is not None else None,
+                "lr_r2": round(float(lr_r2), 3),
+                "lr_prediction": round(float(lr_future * 100), 2),
+                "rf_prediction": round(float(rf_pred * 100), 2) if rf_pred is not None else None,
+            }
+        except Exception as e:
+            return {"error": str(e)}
+
+
+# ─── Analyse d'un coin ──────────────────────────────────────────
+
+class CoinBrain:
+    """Analyse intelligente d'un actif avec TOUS les indicateurs"""
+
+    def __init__(self, coin_id: str, df: pd.DataFrame, fetcher: DataFetcher):
         self.coin_id = coin_id
-        self.ohlc = ohlc_df
-        self.prices = price_df
-        self.info = {}
+        self.df = df
+        self.fetcher = fetcher
         self.indicators = {}
-        self.signals = {}
-        self.result = {}
+        self.ml = MLPredictor()
+        self.llm = LLMAnalyzer()
 
-    def compute_indicators(self):
-        """Calcule tous les indicateurs techniques"""
-        df = self.ohlc.copy()
-        if df.empty or len(df) < 50:
+    def compute(self) -> bool:
+        """Calcul de tous les indicateurs"""
+        df = self.df
+        if df.empty or len(df) < 30:
             return False
 
         close = df["close"].astype(float)
         high = df["high"].astype(float)
         low = df["low"].astype(float)
+        current = float(close.iloc[-1])
 
         # Prix et variation
-        current_price = float(close.iloc[-1])
-        price_24h = float(close.iloc[-2]) if len(close) > 1 else current_price
-        change_24h = ((current_price - price_24h) / price_24h) * 100
+        change_24h = ((current - float(close.iloc[-2])) / float(close.iloc[-2])) * 100 if len(close) > 1 else 0
 
-        # --- RSI ---
-        rsi = calc_rsi(close, 14)
+        # --- Tous les indicateurs ---
+        rsi_series = Indicators.rsi(close)
+        ema9 = Indicators.ema(close, 9)
+        ema21 = Indicators.ema(close, 21)
+        ema50 = Indicators.ema(close, 50) if len(close) >= 50 else pd.Series(index=close.index)
+        ema200 = Indicators.ema(close, 200) if len(close) >= 200 else pd.Series(index=close.index)
+        macd_line, macd_sig, macd_hist = Indicators.macd(close)
+        bb_up, bb_mid, bb_low, bb_pct, bb_wid = Indicators.bollinger(close)
+        adx_s, pdi, ndi, atr_s = Indicators.adx(df)
+        stoch_k, stoch_d = Indicators.stoch(high, low, close)
+        mfi_s = Indicators.mfi(df)
+        ha = Indicators.heikin_ashi(df)
+        atr_v = Indicators.atr(df)
 
-        # --- EMA ---
-        ema9 = calc_ema(close, 9)
-        ema21 = calc_ema(close, 21)
-        ema50 = calc_ema(close, 50) if len(close) >= 50 else pd.Series(index=close.index)
-        ema200 = calc_ema(close, 200) if len(close) >= 200 else pd.Series(index=close.index)
+        vol_sma = df.get("volume", pd.Series(1, index=df.index)).rolling(20).mean()
+        vol_ratio = df.get("volume", pd.Series(1, index=df.index)) / vol_sma.replace(0, np.nan)
 
-        # --- MACD ---
-        macd_line, macd_signal, macd_hist = calc_macd(close)
+        # Divergences
+        divergences = Indicators.find_divergence(close.values, rsi_series.values)
 
-        # --- Bollinger Bands ---
-        bb_up, bb_mid, bb_low, bb_percent, bb_width = calc_bollinger_bands(close)
+        # Fibonacci
+        lookback_90 = min(90, len(close))
+        fib = Indicators.fib_retracement(float(high.iloc[-lookback_90:].max()),
+                                          float(low.iloc[-lookback_90:].min()))
 
-        # --- ADX ---
-        adx_series, plus_di, minus_di, atr_series = calc_adx(df)
+        # Support/Resistance
+        sr = Indicators.support_resistance(high, low)
 
-        # --- Stochastique ---
-        stoch_k, stoch_d = calc_stoch(high, low, close)
+        # ATR
+        atr_val = float(atr_s.iloc[-1]) if not atr_s.empty and pd.notna(atr_s.iloc[-1]) else 0
+        atr_pct = (atr_val / current * 100) if current > 0 else 0
 
-        # --- MFI ---
-        mfi = calc_mfi(df)
+        # ML prediction
+        ml_pred = self.ml.predict(df)
 
-        # --- Heikin Ashi ---
-        ha = calc_heikin_ashi(df)
-
-        # --- Volume ---
-        volumes = df.get("volume", pd.Series(1, index=df.index))
-        vol_sma = volumes.rolling(20).mean()
-        vol_ratio = volumes / vol_sma.replace(0, np.nan)
-
-        # --- ATR pour volatilite ---
-        atr_val = float(atr_series.iloc[-1]) if not atr_series.empty and pd.notna(atr_series.iloc[-1]) else 0
-        atr_pct = (atr_val / current_price * 100) if current_price > 0 else 0
-
-        # --- Support / Resistance ---
-        lookback = min(50, len(close))
-        recent_low = float(low.iloc[-lookback:].min())
-        recent_high = float(high.iloc[-lookback:].max())
-
-        # Dernieres valeurs
         self.indicators = {
-            "current_price": current_price,
+            "current_price": current,
             "change_24h": round(change_24h, 2),
-            "rsi": round(float(rsi.iloc[-1]), 2) if pd.notna(rsi.iloc[-1]) else None,
+            "rsi": round(float(rsi_series.iloc[-1]), 2) if pd.notna(rsi_series.iloc[-1]) else None,
             "ema9": float(ema9.iloc[-1]) if pd.notna(ema9.iloc[-1]) else None,
             "ema21": float(ema21.iloc[-1]) if pd.notna(ema21.iloc[-1]) else None,
             "ema50": float(ema50.iloc[-1]) if not ema50.empty and pd.notna(ema50.iloc[-1]) else None,
             "ema200": float(ema200.iloc[-1]) if not ema200.empty and pd.notna(ema200.iloc[-1]) else None,
             "macd": float(macd_line.iloc[-1]) if pd.notna(macd_line.iloc[-1]) else None,
-            "macd_signal": float(macd_signal.iloc[-1]) if pd.notna(macd_signal.iloc[-1]) else None,
+            "macd_signal": float(macd_sig.iloc[-1]) if pd.notna(macd_sig.iloc[-1]) else None,
             "macd_hist": float(macd_hist.iloc[-1]) if pd.notna(macd_hist.iloc[-1]) else None,
             "bb_upper": float(bb_up.iloc[-1]) if pd.notna(bb_up.iloc[-1]) else None,
             "bb_mid": float(bb_mid.iloc[-1]) if pd.notna(bb_mid.iloc[-1]) else None,
             "bb_lower": float(bb_low.iloc[-1]) if pd.notna(bb_low.iloc[-1]) else None,
-            "bb_percent": round(float(bb_percent.iloc[-1]), 3) if pd.notna(bb_percent.iloc[-1]) else None,
-            "bb_width": round(float(bb_width.iloc[-1]), 3) if pd.notna(bb_width.iloc[-1]) else None,
-            "adx": round(float(adx_series.iloc[-1]), 2) if pd.notna(adx_series.iloc[-1]) else None,
-            "plus_di": round(float(plus_di.iloc[-1]), 2) if pd.notna(plus_di.iloc[-1]) else None,
-            "minus_di": round(float(minus_di.iloc[-1]), 2) if pd.notna(minus_di.iloc[-1]) else None,
+            "bb_percent": round(float(bb_pct.iloc[-1]), 3) if pd.notna(bb_pct.iloc[-1]) else None,
+            "bb_width": round(float(bb_wid.iloc[-1]), 3) if pd.notna(bb_wid.iloc[-1]) else None,
+            "adx": round(float(adx_s.iloc[-1]), 2) if pd.notna(adx_s.iloc[-1]) else None,
+            "plus_di": round(float(pdi.iloc[-1]), 2) if pd.notna(pdi.iloc[-1]) else None,
+            "minus_di": round(float(ndi.iloc[-1]), 2) if pd.notna(ndi.iloc[-1]) else None,
             "stoch_k": round(float(stoch_k.iloc[-1]), 2) if pd.notna(stoch_k.iloc[-1]) else None,
             "stoch_d": round(float(stoch_d.iloc[-1]), 2) if pd.notna(stoch_d.iloc[-1]) else None,
-            "mfi": round(float(mfi.iloc[-1]), 2) if pd.notna(mfi.iloc[-1]) else None,
+            "mfi": round(float(mfi_s.iloc[-1]), 2) if pd.notna(mfi_s.iloc[-1]) else None,
             "atr": round(atr_val, 4),
             "atr_pct": round(atr_pct, 2),
             "vol_ratio": round(float(vol_ratio.iloc[-1]), 2) if pd.notna(vol_ratio.iloc[-1]) else None,
-            "support": round(recent_low, 6),
-            "resistance": round(recent_high, 6),
+            "support": round(float(sr.get("support", 0)), 6),
+            "resistance": round(float(sr.get("resistance", 0)), 6),
             "ha_trend": int(ha["ha_trend"].iloc[-1]) if not ha.empty else 0,
-            "ha_streak": self._count_ha_streak(ha),
+            "ha_streak": int(ha["ha_streak"].iloc[-1]) if not ha.empty else 0,
+            "divergences": divergences[-3:] if divergences else [],
+            "fibonacci": {k: round(float(v), 2) for k, v in fib.items()},
+            "ml_prediction": ml_pred,
+            "data_points": len(df),
         }
-
         return True
 
-    def _count_ha_streak(self, ha):
-        """Compte le nombre de bougies HA consecutives dans la meme direction"""
-        if len(ha) < 3:
-            return 0
-        trend = ha["ha_trend"].values
-        last = trend[-1]
-        count = 0
-        for i in range(len(trend) - 1, -1, -1):
-            if trend[i] == last:
-                count += 1
-            else:
-                break
-        return count
-
-    def generate_signals(self):
-        """Genere les signaux avec score pondere"""
+    def generate_signal(self) -> dict:
+        """Systeme de scoring intelligent multicriteres"""
         ind = self.indicators
         score = 0.0
         max_score = 0.0
         reasons = []
         details = {}
 
-        # ─── RSI (2 pts) ───
-        w = WEIGHTS["rsi"]
-        max_score += w
-        if ind["rsi"] is not None:
-            if ind["rsi"] < 30:
-                score += w; reasons.append(f"RSI survente ({ind['rsi']})")
-                details["rsi"] = {"signal": "bullish", "weight": w, "value": ind["rsi"]}
-            elif ind["rsi"] < 40:
-                score += w * 0.5; reasons.append(f"RSI bas ({ind['rsi']})")
-                details["rsi"] = {"signal": "slight_bullish", "weight": w, "value": ind["rsi"]}
-            elif ind["rsi"] > 70:
-                score -= w; reasons.append(f"RSI surachat ({ind['rsi']})")
-                details["rsi"] = {"signal": "bearish", "weight": w, "value": ind["rsi"]}
-            elif ind["rsi"] > 60:
-                score -= w * 0.5; reasons.append(f"RSI haut ({ind['rsi']})")
-                details["rsi"] = {"signal": "slight_bearish", "weight": w, "value": ind["rsi"]}
-            else:
-                details["rsi"] = {"signal": "neutral", "weight": w, "value": ind["rsi"]}
+        # POIDS: RSI=2, MACD=2, BB=1.5, ADX=1.5, Stoch=1, MFI=1, EMA=1.5, Vol=1, HA=1, ML=2 (nouveau)
 
-        # ─── MACD (2 pts) ───
-        w = WEIGHTS["macd"]
-        max_score += w
+        # RSI
+        w = 2.0; max_score += w
+        if ind["rsi"] is not None:
+            if ind["rsi"] < 30: score += w; reasons.append(f"RSI survente ({ind['rsi']})")
+            elif ind["rsi"] < 40: score += w*0.5; reasons.append(f"RSI bas ({ind['rsi']})")
+            elif ind["rsi"] > 70: score -= w; reasons.append(f"RSI surachat ({ind['rsi']})")
+            elif ind["rsi"] > 60: score -= w*0.5; reasons.append(f"RSI haut ({ind['rsi']})")
+
+        # MACD
+        w = 2.0; max_score += w
         if ind["macd"] is not None and ind["macd_signal"] is not None:
             if ind["macd"] > ind["macd_signal"]:
-                score += w; reasons.append(f"MACD > Signal (haussier)")
-                details["macd"] = {"signal": "bullish", "weight": w}
+                score += w; reasons.append("MACD haussier")
             else:
-                score -= w; reasons.append(f"MACD < Signal (baissier)")
-                details["macd"] = {"signal": "bearish", "weight": w}
-            if ind["macd_hist"] is not None:
-                if ind["macd_hist"] > 0 and ind["macd_hist"] > details.get("prev_macd_hist", 0):
-                    score += w * 0.3
-                    reasons.append(f"Histogramme MACD croissant")
+                score -= w; reasons.append("MACD baissier")
+            if ind["macd_hist"] is not None and abs(ind["macd_hist"]) < abs(ind["macd"] - ind.get("prev_macd", 0)):
+                # Convergence
+                if ind["macd_hist"] > 0: score += w*0.3
 
-        # ─── Bollinger Bands (1.5 pts) ───
-        w = WEIGHTS["bbands"]
-        max_score += w
+        # Bollinger
+        w = 1.5; max_score += w
         if ind["bb_percent"] is not None:
-            if ind["bb_percent"] < 0.05:
-                score += w; reasons.append(f"Prix touche bande basse BB (rebond potentiel)")
-                details["bbands"] = {"signal": "bullish", "weight": w}
-            elif ind["bb_percent"] < 0.2:
-                score += w * 0.5; reasons.append(f"Prix proche bande basse BB")
-                details["bbands"] = {"signal": "slight_bullish", "weight": w}
-            elif ind["bb_percent"] > 0.95:
-                score -= w; reasons.append(f"Prix touche bande haute BB (revers potentiel)")
-                details["bbands"] = {"signal": "bearish", "weight": w}
-            elif ind["bb_percent"] > 0.8:
-                score -= w * 0.5; reasons.append(f"Prix proche bande haute BB")
-                details["bbands"] = {"signal": "slight_bearish", "weight": w}
-            else:
-                details["bbands"] = {"signal": "neutral", "weight": w}
+            if ind["bb_percent"] < 0.05: score += w; reasons.append("Prix touche bande basse BB")
+            elif ind["bb_percent"] < 0.2: score += w*0.5
+            elif ind["bb_percent"] > 0.95: score -= w; reasons.append("Prix touche bande haute BB")
+            elif ind["bb_percent"] > 0.8: score -= w*0.5
 
-        # ─── ADX — force de tendance (1 pt) ───
-        w = WEIGHTS["adx"]
-        max_score += w
-        if ind["adx"] is not None:
+        # ADX + Direction
+        w = 1.5; max_score += w
+        if ind["adx"] is not None and ind["plus_di"] is not None:
             if ind["adx"] > 25:
-                # Tendance forte
-                if ind["plus_di"] is not None and ind["minus_di"] is not None:
-                    if ind["plus_di"] > ind["minus_di"]:
-                        score += w; reasons.append(f"ADX forte tendance HAUSSIERE ({ind['adx']})")
-                        details["adx"] = {"signal": "bullish", "weight": w}
-                    else:
-                        score -= w; reasons.append(f"ADX forte tendance BAISSIERE ({ind['adx']})")
-                        details["adx"] = {"signal": "bearish", "weight": w}
+                if ind["plus_di"] > ind["minus_di"]:
+                    score += w; reasons.append(f"Tendance haussiere forte (ADX {ind['adx']})")
+                else:
+                    score -= w; reasons.append(f"Tendance baissiere forte (ADX {ind['adx']})")
             elif ind["adx"] > 20:
-                details["adx"] = {"signal": "neutral", "weight": w, "trend_strength": "faible"}
-            else:
-                details["adx"] = {"signal": "neutral", "weight": w, "trend_strength": "aucune"}
+                if ind["plus_di"] > ind["minus_di"]: score += w*0.3
+                else: score -= w*0.3
 
-        # ─── Stochastique (1 pt) ───
-        w = WEIGHTS["stoch"]
-        max_score += w
-        if ind["stoch_k"] is not None and ind["stoch_d"] is not None:
-            if ind["stoch_k"] < 20 and ind["stoch_d"] < 20:
-                score += w; reasons.append(f"Stochastique survente")
-                details["stoch"] = {"signal": "bullish", "weight": w}
-            elif ind["stoch_k"] < 30:
-                score += w * 0.3; reasons.append(f"Stochastique bas")
-                details["stoch"] = {"signal": "slight_bullish", "weight": w}
-            elif ind["stoch_k"] > 80 and ind["stoch_d"] > 80:
-                score -= w; reasons.append(f"Stochastique surachat")
-                details["stoch"] = {"signal": "bearish", "weight": w}
-            elif ind["stoch_k"] > 70:
-                score -= w * 0.3; reasons.append(f"Stochastique haut")
-                details["stoch"] = {"signal": "slight_bearish", "weight": w}
-            else:
-                details["stoch"] = {"signal": "neutral", "weight": w}
+        # Stochastique
+        w = 1.0; max_score += w
+        if ind["stoch_k"] is not None:
+            if ind["stoch_k"] < 20: score += w; reasons.append("Stochastique survente")
+            elif ind["stoch_k"] > 80: score -= w; reasons.append("Stochastique surachat")
+            elif ind["stoch_k"] < 30: score += w*0.3
+            elif ind["stoch_k"] > 70: score -= w*0.3
 
-        # ─── MFI (1 pt) ───
-        w = WEIGHTS["mfi"]
-        max_score += w
+        # MFI
+        w = 1.0; max_score += w
         if ind["mfi"] is not None:
-            if ind["mfi"] < 20:
-                score += w; reasons.append(f"MFI survente ({ind['mfi']})")
-                details["mfi"] = {"signal": "bullish", "weight": w}
-            elif ind["mfi"] > 80:
-                score -= w; reasons.append(f"MFI surachat ({ind['mfi']})")
-                details["mfi"] = {"signal": "bearish", "weight": w}
-            else:
-                details["mfi"] = {"signal": "neutral", "weight": w}
+            if ind["mfi"] < 20: score += w; reasons.append(f"MFI survente ({ind['mfi']})")
+            elif ind["mfi"] > 80: score -= w; reasons.append(f"MFI surachat ({ind['mfi']})")
 
-        # ─── EMA Trend (1.5 pts) ───
-        w = WEIGHTS["ema_trend"]
-        max_score += w
+        # EMA Trend
+        w = 1.5; max_score += w
         ema_score = 0.0
         if ind["ema9"] and ind["ema21"]:
-            if ind["ema9"] > ind["ema21"]:
-                ema_score += 0.4; reasons.append("EMA9 > EMA21 (court terme haussier)")
-            else:
-                ema_score -= 0.4; reasons.append("EMA9 < EMA21 (court terme baissier)")
-        if ind.get("ema50") and ind["current_price"]:
-            if ind["current_price"] > ind["ema50"]:
-                ema_score += 0.3; reasons.append("Prix > EMA50")
-            else:
-                ema_score -= 0.3; reasons.append("Prix < EMA50")
-        if ind.get("ema200") and ind["current_price"]:
-            if ind["current_price"] > ind["ema200"]:
-                ema_score += 0.3; reasons.append("Prix > EMA200 (tendance long terme haussiere)")
-            else:
-                ema_score -= 0.3; reasons.append("Prix < EMA200 (tendance long terme baissiere)")
+            if ind["ema9"] > ind["ema21"]: ema_score += 0.4
+            else: ema_score -= 0.4
+        if ind.get("ema50") and ind["current_price"] > ind["ema50"]: ema_score += 0.3
+        elif ind.get("ema50"): ema_score -= 0.3
+        if ind.get("ema200") and ind["current_price"] > ind["ema200"]: ema_score += 0.3
+        elif ind.get("ema200"): ema_score -= 0.3
         score += ema_score * w / 1.0
-        details["ema_trend"] = {"signal": "bullish" if ema_score > 0 else "bearish", "weight": w}
 
-        # ─── Volume (1 pt) ───
-        w = WEIGHTS["volume"]
-        max_score += w
+        # Volume
+        w = 1.0; max_score += w
         if ind["vol_ratio"] is not None:
-            if ind["vol_ratio"] > 1.5:
-                score += w; reasons.append(f"Volume eleve ({ind['vol_ratio']}x moyenne)")
-                details["volume"] = {"signal": "confirmation", "weight": w}
-            elif ind["vol_ratio"] < 0.5:
-                score -= w * 0.5; reasons.append(f"Volume faible ({ind['vol_ratio']}x moyenne)")
-                details["volume"] = {"signal": "weak", "weight": w}
-            else:
-                details["volume"] = {"signal": "neutral", "weight": w}
+            if ind["vol_ratio"] > 1.5: score += w; reasons.append(f"Volume eleve ({ind['vol_ratio']}x)")
+            elif ind["vol_ratio"] < 0.5: score -= w*0.5
 
-        # ─── Heikin Ashi (1 pt) ───
-        w = WEIGHTS["heikin_ashi"]
-        max_score += w
-        if ind["ha_trend"] == 1:
-            score += w * 0.5; reasons.append(f"Bougies Heikin Ashi haussiere (x{ind['ha_streak']})")
-            details["heikin_ashi"] = {"signal": "bullish", "weight": w}
-        elif ind["ha_trend"] == -1:
-            score -= w * 0.5; reasons.append(f"Bougies Heikin Ashi baissiere (x{ind['ha_streak']})")
-            details["heikin_ashi"] = {"signal": "bearish", "weight": w}
+        # Heikin Ashi
+        w = 1.0; max_score += w
+        if ind["ha_trend"] == 1: score += w*0.5
+        elif ind["ha_trend"] == -1: score -= w*0.5
 
-        # ─── Signal final ───
-        normalized_score = score / max_score if max_score > 0 else 0  # -1 à +1
+        # Divergences (bonus/malus supplementaire)
+        if ind.get("divergences"):
+            for div in ind["divergences"][:2]:
+                if div["type"] == "bullish":
+                    score += 1.5; reasons.append(f"Divergence haussiere detectee (prix ${div['price']:.2f})")
+                else:
+                    score -= 1.5; reasons.append(f"Divergence baissiere detectee")
 
-        if normalized_score >= 0.4:
-            signal = "ACHAT"
-            niveau = "FORT" if normalized_score >= 0.6 else "MOYEN"
-        elif normalized_score <= -0.4:
-            signal = "VENTE"
-            niveau = "FORT" if normalized_score <= -0.6 else "MOYEN"
-        else:
-            signal = "NEUTRE"
-            niveau = "FAIBLE"
+        # ML Prediction (2 pts)
+        w = 2.0; max_score += w
+        ml = ind.get("ml_prediction", {})
+        if "error" not in ml and ml.get("prediction_5d") is not None:
+            if ml["prediction_5d"] > 3: score += w; reasons.append(f"ML predit +{ml['prediction_5d']}% (5j)")
+            elif ml["prediction_5d"] > 1: score += w*0.5
+            elif ml["prediction_5d"] < -3: score -= w; reasons.append(f"ML predit {ml['prediction_5d']}% (5j)")
+            elif ml["prediction_5d"] < -1: score -= w*0.5
 
-        self.signals = {
-            "signal": signal,
-            "niveau": niveau,
-            "raw_score": round(score, 2),
-            "max_score": round(max_score, 2),
-            "normalized_score": round(normalized_score, 4),
-            "reasons": reasons[:10],
-            "details": details,
+        # Signal final
+        normalized = score / max_score if max_score > 0 else 0
+
+        if normalized >= 0.35: signal = "ACHAT"; niveau = "FORT" if normalized >= 0.55 else "MOYEN"
+        elif normalized <= -0.35: signal = "VENTE"; niveau = "FORT" if normalized <= -0.55 else "MOYEN"
+        else: signal = "NEUTRE"; niveau = "FAIBLE"
+
+        return {
+            "signal": signal, "niveau": niveau,
+            "raw_score": round(score, 2), "max_score": round(max_score, 2),
+            "normalized_score": round(normalized, 4),
+            "reasons": reasons[:15], "details": details,
         }
-        return True
 
-    def build_result(self):
-        """Construit le dictionnaire de resultat final"""
+    def build_result(self) -> dict:
+        """Construit le resultat complet"""
         ind = self.indicators
-        sig = self.signals
 
-        # Detection de patterns supplementaires
+        # Patterns detectes
         patterns = []
-        if ind.get("rsi") is not None and ind["rsi"] < 30 and sig.get("signal") == "ACHAT":
-            patterns.append("Overshoot RS (divergence haussiere potentielle)")
-        if ind.get("bb_width") is not None and ind["bb_width"] > 0.3:
-            patterns.append("Bollinger Squeeze (volatilite imminente)")
+        if ind.get("rsi") is not None and ind["rsi"] < 30 and ind.get("divergences"):
+            if any(d["type"] == "bullish" for d in ind["divergences"]):
+                patterns.append("Divergence haussiere RSI (signal fort de retournement)")
+        if ind.get("bb_width") is not None and ind["bb_width"] > 0.35:
+            patterns.append("Bollinger Squeeze (explosion de volatilite imminente)")
         if ind.get("ha_trend") == 1 and ind.get("ha_streak", 0) >= 5:
-            patterns.append(f"Tendance HA confirmee ({ind['ha_streak']} bougies)")
+            patterns.append(f"Tendance Heikin Ashi confirmee ({ind['ha_streak']} bougies)")
+        if ind.get("adx") is not None and ind["adx"] > 30:
+            if ind.get("plus_di", 0) > ind.get("minus_di", 0):
+                patterns.append("Tendance haussiere forte (ADX > 30, +DI > -DI)")
+            else:
+                patterns.append("Tendance baissiere forte (ADX > 30, -DI > +DI)")
 
-        self.result = {
+        # Fibonacci zones
+        fib = ind.get("fibonacci", {})
+        fib_zone = ""
+        if fib and ind["current_price"]:
+            for level, price in sorted(fib.items(), key=lambda x: float(x[0])):
+                if abs(ind["current_price"] - price) / price < 0.02:
+                    fib_zone = f"Prix proche retracement Fib {level} (${price:.2f})"
+                    patterns.append(fib_zone)
+
+        return {
             "coin": self.coin_id,
             "name": self.coin_id.replace("-", " ").title(),
             "price": ind["current_price"],
             "change_24h": ind.get("change_24h", 0),
-            "indicators": {k: v for k, v in ind.items() if k not in ("current_price", "change_24h")},
-            "signal": sig.get("signal", "NEUTRE"),
-            "signal_niveau": sig.get("niveau", "FAIBLE"),
-            "signal_score": sig.get("raw_score", 0),
-            "signal_max": sig.get("max_score", 1),
-            "normalized_score": sig.get("normalized_score", 0),
-            "reasons": sig.get("reasons", []),
-            "details": sig.get("details", {}),
+            "indicators": ind,
+            "signal": self.signal.get("signal", "NEUTRE"),
+            "signal_niveau": self.signal.get("niveau", "FAIBLE"),
+            "signal_score": self.signal.get("raw_score", 0),
+            "signal_max": self.signal.get("max_score", 1),
+            "normalized_score": self.signal.get("normalized_score", 0),
+            "reasons": self.signal.get("reasons", []),
             "patterns": patterns,
             "timestamp": datetime.now().isoformat(),
+            "ml": ind.get("ml_prediction", {}),
+            "divergences": ind.get("divergences", []),
+            "fibonacci": ind.get("fibonacci", {}),
         }
-        return self.result
 
 
-# ─── Analyseur principal ───────────────────────────────────────────
+# ─── Analyseur principal ──────────────────────────────────────────
 
 class MarketAnalyzer:
-    """Analyseur multi-coins avec reporting"""
+    """Analyseur intelligent multi-coins"""
 
-    def __init__(self):
+    def __init__(self, use_llm=False):
         self.results = []
+        self.fetcher = DataFetcher()
+        self.llm = LLMAnalyzer() if use_llm else None
+        self.use_llm = use_llm
 
-    def analyze_coin(self, coin_id):
-        """Analyse complete d'une crypto"""
+    def analyze_coin(self, coin_id: str) -> Optional[dict]:
         display_name = coin_id.replace("-", " ").title()[:25]
-        print(f"\n  {display_name}...", end=" ", flush=True)
+        sys.stdout.write(f"\n  {display_name}... ")
+        sys.stdout.flush()
 
         try:
-            df = fetch_market_data(coin_id, days=60)
-            time.sleep(REQUEST_DELAY)
-
+            df = self.fetcher.fetch_market_data(coin_id, days=365)
             if df.empty:
-                print("pas de donnees")
+                print(f"pas de donnees (limite API)")
                 return None
 
-            analysis = CoinAnalysis(coin_id, df, df)
-            if not analysis.compute_indicators():
-                print("calcul impossible")
+            brain = CoinBrain(coin_id, df, self.fetcher)
+            if not brain.compute():
+                print(f"calcul impossible")
                 return None
-            analysis.generate_signals()
-            result = analysis.build_result()
+            brain.signal = brain.generate_signal()
+            result = brain.build_result()
 
-            # Affiche resume
+            # Resume visuel
             sig = result["signal"]
-            if sig == "ACHAT":
-                sig_icon = "🟢"
-            elif sig == "VENTE":
-                sig_icon = "🔴"
-            else:
-                sig_icon = "⚪"
+            icon = "🟢" if sig == "ACHAT" else ("🔴" if sig == "VENTE" else "⚪")
             price_str = self._fmt_price(result["price"])
-            print(f"{sig_icon} {sig} ({result['signal_niveau']}) {price_str}")
+            print(f"{icon} {sig} ({result['signal_niveau']}) {price_str}")
             return result
 
         except Exception as e:
@@ -629,295 +849,305 @@ class MarketAnalyzer:
         if p < 10000: return f"${p:.2f}"
         return f"${p:,.0f}"
 
-    def analyze_multiple(self, coins, show_progress=True):
-        """Analyse plusieurs coins"""
+    def analyze_multiple(self, coins):
         self.results = []
         for coin in coins:
-            result = self.analyze_coin(coin)
-            if result:
-                self.results.append(result)
-            time.sleep(REQUEST_DELAY * 0.5)
+            r = self.analyze_coin(coin)
+            if r: self.results.append(r)
         return self.results
 
-    def get_market_summary(self):
-        """Resume du marche"""
-        valid = [r for r in self.results if r is not None]
-        if not valid or len(valid) == 0:
-            return {"total": 0, "achat": 0, "vente": 0, "neutre": 0,
-                    "achat_fort": 0, "vente_fort": 0, "best_score": 0, "worst_score": 0}
-
+    def get_summary(self):
+        valid = [r for r in self.results if r]
+        if not valid: return {"total": 0}
         buys = [r for r in valid if r["signal"] == "ACHAT"]
         sells = [r for r in valid if r["signal"] == "VENTE"]
-        neutrals = [r for r in valid if r["signal"] == "NEUTRE"]
-
-        strong_buys = [r for r in buys if r["signal_niveau"] == "FORT"]
-        strong_sells = [r for r in sells if r["signal_niveau"] == "FORT"]
-
         return {
             "timestamp": datetime.now().isoformat(),
             "total": len(valid),
-            "achat": len(buys),
-            "vente": len(sells),
-            "neutre": len(neutrals),
-            "achat_fort": len(strong_buys),
-            "vente_fort": len(strong_sells),
+            "achat": len(buys), "vente": len(sells),
+            "neutre": len(valid) - len(buys) - len(sells),
+            "achat_fort": len([r for r in buys if r["signal_niveau"] == "FORT"]),
+            "vente_fort": len([r for r in sells if r["signal_niveau"] == "FORT"]),
             "best_score": max([r.get("normalized_score", -1) for r in valid], default=0),
             "worst_score": min([r.get("normalized_score", 1) for r in valid], default=0),
         }
 
     def print_report(self):
-        """Affiche le rapport complet dans le terminal"""
-        valid = [r for r in self.results if r is not None]
-        print(f"\n{'='*60}")
-        print(f"  HERMES TRADING BOT v2 — Rapport {datetime.now().strftime('%d/%m/%Y %H:%M')}")
-        print(f"{'='*60}")
+        valid = [r for r in self.results if r]
+        print(f"\n{'='*62}")
+        print(f"  HERMES TRADING BOT v3 — {datetime.now().strftime('%d/%m/%Y %H:%M')}")
+        print(f"{'='*62}")
 
-        summary = self.get_market_summary()
+        summary = self.get_summary()
         if summary["total"] == 0:
-            print(f"\n  ⚠ Aucun actif analyse — verifier les limites API")
+            print("\n  Aucun actif analyse.")
             return
 
-        summary = self.get_market_summary()
-        print(f"\n  📊 Marche: {summary['total']} actifs | "
-              f"🟢 {summary['achat']} ACHAT ({summary['achat_fort']} fort) | "
-              f"🔴 {summary['vente']} VENTE ({summary['vente_fort']} fort) | "
-              f"⚪ {summary['neutre']} NEUTRE")
-
-        # Tri par score
-        sorted_results = sorted(valid, key=lambda r: r.get("normalized_score", 0), reverse=True)
+        print(f"\n  Marche: {summary['total']} actifs | "
+              f"ACHAT {summary['achat']} ({summary['achat_fort']} fort) | "
+              f"VENTE {summary['vente']} ({summary['vente_fort']} fort) | "
+              f"NEUTRE {summary['neutre']}")
 
         # Top BUY
-        top_buys = [r for r in sorted_results if r["signal"] == "ACHAT"][:5]
+        sorted_r = sorted(valid, key=lambda r: r.get("normalized_score", 0), reverse=True)
+        top_buys = [r for r in sorted_r if r["signal"] == "ACHAT"]
+        top_sells = [r for r in sorted_r if r["signal"] == "VENTE"]
+
         if top_buys:
             print(f"\n  🟢 TOP SIGNAL ACHAT")
-            print(f"  {'Coin':<18} {'Prix':<12} {'Score':<8} {'Niveau':<8} {'RSI':<8} {'Ratio Vol':<10}")
-            print(f"  {'-'*60}")
-            for r in top_buys:
-                score = f"{r['normalized_score']:+.2f}"
-                rsi = str(r["indicators"].get("rsi", "-"))
-                vol = str(r["indicators"].get("vol_ratio", "-"))
-                print(f"  {r['name']:<18} {self._fmt_price(r['price']):<12} {score:<8} "
-                      f"{r['signal_niveau']:<8} {rsi:<8} {vol:<10}")
+            print(f"  {'Coin':<18} {'Prix':<12} {'Score':<8} {'Niv':<6} {'RSI':<6} {'ADX':<6} {'ML 5j':<8} {'Vol':<6}")
+            print(f"  {'-'*66}")
+            for r in top_buys[:5]:
+                i = r.get("indicators", {})
+                ml = r.get("ml", {})
+                ml_str = f"{ml.get('prediction_5d', '-')}%" if "error" not in ml else "-"
+                print(f"  {r['name']:<18} {self._fmt_price(r['price']):<12} {r['normalized_score']:+.2f}  "
+                      f"{r['signal_niveau']:<6} {i.get('rsi','-'):<6} {i.get('adx','-'):<6} "
+                      f"{ml_str:<8} {i.get('vol_ratio','-'):<6}")
 
-        # Top SELL
-        top_sells = [r for r in sorted_results if r["signal"] == "VENTE"][:3]
         if top_sells:
             print(f"\n  🔴 TOP SIGNAL VENTE")
-            print(f"  {'Coin':<18} {'Prix':<12} {'Score':<8} {'Niveau':<8} {'RSI':<8}")
-            print(f"  {'-'*60}")
-            for r in top_sells:
-                score = f"{r['normalized_score']:+.2f}"
-                rsi = str(r["indicators"].get("rsi", "-"))
-                print(f"  {r['name']:<18} {self._fmt_price(r['price']):<12} {score:<8} "
-                      f"{r['signal_niveau']:<8} {rsi:<8}")
+            for r in top_sells[:3]:
+                print(f"     {r['name']:<20} score {r['normalized_score']:+.2f} RSI {r.get('indicators',{}).get('rsi','-')}")
 
-        # Details de chaque coin
-        for r in sorted_results:
+        # Details enrichis
+        print(f"\n  ── Analyses detaillees ──")
+        for r in sorted_r:
             sig = r["signal"]
-            if sig == "ACHAT": ico = "🟢"
-            elif sig == "VENTE": ico = "🔴"
-            else: ico = "⚪"
-            i = r["indicators"]
-            
-            print(f"\n  {ico} {r['name']:<20} {self._fmt_price(r['price']):<12} "
-                  f"{sig} ({r['signal_niveau']}) score {r['normalized_score']:+.2f}")
-            
-            details = []
-            if i.get("rsi") is not None: details.append(f"RSI {i['rsi']}")
-            if i.get("macd_hist") is not None: details.append(f"MACDh {i['macd_hist']:+.2f}")
-            if i.get("adx") is not None: details.append(f"ADX {i['adx']}")
-            if i.get("bb_percent") is not None: details.append(f"BB% {i['bb_percent']:.2f}")
-            if i.get("mfi") is not None: details.append(f"MFI {i['mfi']}")
-            if i.get("vol_ratio") is not None: details.append(f"Vol {i['vol_ratio']}x")
-            if i.get("atr_pct") is not None: details.append(f"ATR {i['atr_pct']}%")
-            if i.get("ha_trend") is not None: details.append(f"HA {'HAUSS' if i['ha_trend']==1 else 'BAISS'}")
-            if details:
-                print(f"     {' | '.join(details)}")
-            
-            for reason in r["reasons"][:3]:
-                print(f"     → {reason}")
-            if r["patterns"]:
-                for p in r["patterns"][:2]:
-                    print(f"     ★ {p}")
+            icon = "🟢" if sig == "ACHAT" else "🔴" if sig == "VENTE" else "⚪"
+            i = r.get("indicators", {})
+            divs = r.get("divergences", [])
+            ml = r.get("ml", {})
 
-        print(f"\n{'='*60}\n")
+            print(f"\n  {icon} {r['name']:<20} {self._fmt_price(r['price']):<12} "
+                  f"{sig} ({r['signal_niveau']}) score {r['normalized_score']:+.2f}")
+
+            # Ligne 1: indicateurs cles
+            parts = []
+            if i.get("rsi"): parts.append(f"RSI {i['rsi']}")
+            if i.get("macd_hist") is not None: parts.append(f"MACDh {i['macd_hist']:+.2f}")
+            if i.get("adx"): parts.append(f"ADX {i['adx']}")
+            if i.get("bb_percent") is not None: parts.append(f"BB% {i['bb_percent']:.2f}")
+            if i.get("mfi"): parts.append(f"MFI {i['mfi']}")
+            if i.get("atr_pct"): parts.append(f"ATR {i['atr_pct']}%")
+            if i.get("vol_ratio"): parts.append(f"Vol {i['vol_ratio']}x")
+            if parts: print(f"     {' | '.join(parts)}")
+
+            # ML
+            if "error" not in ml and ml.get("prediction_5d") is not None:
+                print(f"     ML: predit {ml['prediction_5d']:+.2f}% (confiance {ml.get('confidence','N/A')}) R²={ml.get('r2_score','N/A')}")
+
+            # Fib
+            if i.get("fibonacci"):
+                fib = i["fibonacci"]
+                print(f"     Fib: 0.618={self._fmt_price(fib.get('0.618',0))} 0.5={self._fmt_price(fib.get('0.5',0))}")
+
+            # Reasons
+            for reason in r["reasons"][:4]:
+                print(f"     → {reason}")
+            for p in r.get("patterns", [])[:2]:
+                print(f"     ★ {p}")
+
+        # LLM Analysis
+        if self.llm and self.use_llm:
+            self._llm_report(top_buys[:5], top_sells[:3], summary)
+
+        print(f"\n{'='*62}\n")
+
+    def _llm_report(self, top_buys, top_sells, summary):
+        """Analyse narrative via LLM"""
+        print(f"\n  ── Analyse IA (raisonnement) ──")
+        sys.stdout.flush()
+
+        analysis = self.llm.market_analysis(summary, top_buys, top_sells)
+        if analysis:
+            print(f"\n{analysis}\n")
+        else:
+            print("  (IA non disponible)\n")
 
     def save_report(self, html=False):
-        """Sauvegarde le rapport"""
-        valid = [r for r in self.results if r is not None]
-        timestamp = datetime.now().strftime("%Y%m%d_%H%M")
-
-        # JSON
-        json_path = DATA_DIR / f"analyse_{timestamp}.json"
+        valid = [r for r in self.results if r]
+        ts = datetime.now().strftime("%Y%m%d_%H%M")
         report = {
             "generated_at": datetime.now().isoformat(),
-            "market_summary": self.get_market_summary(),
+            "market_summary": self.get_summary(),
             "results": valid,
         }
-        with open(json_path, "w") as f:
-            json.dump(report, f, indent=2, default=str)
-        print(f"\n  📁 Rapport JSON: {json_path}")
-
-        # History
-        hist_path = DATA_DIR / "history" / f"history_{timestamp}.json"
-        # Garde seulement les donnees essentielles
-        hist = {
-            "timestamp": datetime.now().isoformat(),
-            "summary": self.get_market_summary(),
-            "coins": {r["coin"]: {
-                "price": r["price"],
-                "signal": r["signal"],
-                "score": r["normalized_score"],
-                "rsi": r["indicators"].get("rsi"),
-            } for r in valid},
-        }
-        with open(hist_path, "w") as f:
-            json.dump(hist, f, indent=2)
+        json_path = DATA_DIR / f"analyse_{ts}.json"
+        with open(json_path, "w") as f: json.dump(report, f, indent=2, default=str)
+        print(f"  Rapport JSON: {json_path}")
 
         if html:
-            self._save_html(timestamp)
-
+            self._save_html(ts)
         return json_path
 
     def _save_html(self, timestamp):
-        """Genere un rapport HTML"""
-        valid = [r for r in self.results if r is not None]
-        summary = self.get_market_summary()
-        sorted_results = sorted(valid, key=lambda r: r.get("normalized_score", 0), reverse=True)
+        valid = [r for r in self.results if r]
+        sm = self.get_summary()
+        sorted_r = sorted(valid, key=lambda r: r.get("normalized_score", 0), reverse=True)
 
-        def color_for_signal(sig):
-            return {"ACHAT": "#00c853", "VENTE": "#ff1744", "NEUTRE": "#ffc107"}.get(sig, "#999")
-
-        def score_color(s):
-            if s >= 0.3: return "#00c853"
-            if s <= -0.3: return "#ff1744"
-            return "#ffc107"
+        def sc(s):
+            return "#00c853" if s >= 0.3 else "#ff1744" if s <= -0.3 else "#ffc107"
 
         rows = ""
-        for r in sorted_results:
-            i = r["indicators"]
+        for r in sorted_r:
+            i = r.get("indicators", {})
+            ml = r.get("ml", {})
+            ml_str = f"{ml.get('prediction_5d', 'N/A')}%" if "error" not in ml else "N/A"
+            divs = "; ".join([f"{d['type']} ${d.get('price',0):.2f}" for d in r.get("divergences",[])])
+            fib = r.get("fibonacci", {})
+            fib618 = self._fmt_price(fib.get("0.618", 0)) if fib else "-"
             reasons = "<br>".join([f"• {re}" for re in r["reasons"][:5]])
-            patterns_html = ""
-            for p in r["patterns"][:3]:
-                patterns_html += f'<div class="pattern">{p}</div>'
+            patterns = "".join([f'<div class="p">{p}</div>' for p in r.get("patterns", [])[:2]])
 
-            sc = score_color(r["normalized_score"])
-            rows += f"""
-            <tr>
+            rows += f"""<tr>
                 <td><strong>{r['name']}</strong></td>
                 <td>{self._fmt_price(r['price'])}</td>
-                <td><span style="color: {sc};">{r['normalized_score']:+.2f}</span></td>
-                <td><span class="signal" style="background: {color_for_signal(r['signal'])};">{r['signal']}</span> <small>{r['signal_niveau']}</small></td>
-                <td>{i.get('rsi', '-')}</td>
-                <td>{i.get('macd_hist', '-')}</td>
-                <td>{i.get('adx', '-')}</td>
-                <td>{i.get('vol_ratio', '-')}x</td>
-                <td>{i.get('atr_pct', '-')}%</td>
-                <td><small>{reasons}</small>{patterns_html}</td>
+                <td><span style="color:{sc(r['normalized_score'])};">{r['normalized_score']:+.2f}</span></td>
+                <td><span class="sig" style="background:{sc(r['signal'])};">{r['signal']}</span> {r['signal_niveau']}</td>
+                <td>{i.get('rsi','-')}</td>
+                <td>{i.get('macd_hist','-')}</td>
+                <td>{i.get('adx','-')}</td>
+                <td>{ml_str}</td>
+                <td>{i.get('vol_ratio','-')}x</td>
+                <td>{i.get('atr_pct','-')}%</td>
+                <td>{fib618}</td>
+                <td>{divs}</td>
+                <td><small>{reasons}{patterns}</small></td>
             </tr>"""
 
         html = f"""<!DOCTYPE html>
-<html lang="fr">
-<head>
-    <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>Hermes Trading Bot — Rapport {datetime.now().strftime('%d/%m/%Y %H:%M')}</title>
-    <style>
-        * {{ margin: 0; padding: 0; box-sizing: border-box; }}
-        body {{
-            font-family: -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
-            background: #0a0e17; color: #e0e0e0; padding: 20px;
-        }}
-        .container {{ max-width: 1200px; margin: 0 auto; }}
-        h1 {{ color: #00bcd4; font-size: 1.4rem; margin-bottom: 5px; }}
-        .subtitle {{ color: #888; font-size: 0.9rem; margin-bottom: 20px; }}
-        .summary {{ display: flex; gap: 15px; flex-wrap: wrap; margin-bottom: 20px; }}
-        .stat-card {{ background: #111827; border-radius: 10px; padding: 15px 20px; flex: 1; min-width: 120px; }}
-        .stat-card h3 {{ font-size: 0.75rem; color: #888; text-transform: uppercase; letter-spacing: 0.5px; }}
-        .stat-card .value {{ font-size: 1.5rem; font-weight: 700; margin-top: 5px; }}
-        table {{ width: 100%; border-collapse: collapse; }}
-        th {{ background: #111827; padding: 10px; text-align: left; font-size: 0.75rem; color: #888; text-transform: uppercase; position: sticky; top: 0; }}
-        td {{ padding: 10px; border-bottom: 1px solid #1e293b; font-size: 0.85rem; }}
-        tr:hover td {{ background: #111827; }}
-        .signal {{ display: inline-block; padding: 2px 8px; border-radius: 4px; color: #000; font-weight: 700; font-size: 0.75rem; }}
-        .pattern {{ display: inline-block; background: #1e3a5f; padding: 2px 6px; border-radius: 3px; font-size: 0.7rem; margin: 1px; }}
-        .footer {{ margin-top: 20px; padding: 10px; background: #111827; border-radius: 8px; color: #555; font-size: 0.8rem; text-align: center; }}
-        @media (max-width: 600px) {{ .stat-card .value {{ font-size: 1.2rem; }} }}
-    </style>
-</head>
-<body>
-    <div class="container">
-        <h1>Hermes Trading Bot v2</h1>
-        <div class="subtitle">Analyse marche — {datetime.now().strftime('%d %B %Y %H:%M UTC')}</div>
-        <div class="summary">
-            <div class="stat-card"><h3>Actifs</h3><div class="value">{summary['total']}</div></div>
-            <div class="stat-card" style="border-left: 3px solid #00c853;"><h3>Achat</h3><div class="value" style="color:#00c853;">{summary['achat']} <small style="color:#666;">({summary['achat_fort']} fort)</small></div></div>
-            <div class="stat-card" style="border-left: 3px solid #ff1744;"><h3>Vente</h3><div class="value" style="color:#ff1744;">{summary['vente']} <small style="color:#666;">({summary['vente_fort']} fort)</small></div></div>
-            <div class="stat-card" style="border-left: 3px solid #ffc107;"><h3>Neutre</h3><div class="value" style="color:#ffc107;">{summary['neutre']}</div></div>
-            <div class="stat-card"><h3>Meilleur score</h3><div class="value" style="color:#00c853;">{summary['best_score']:+.2f}</div></div>
-            <div class="stat-card"><h3>Pire score</h3><div class="value" style="color:#ff1744;">{summary['worst_score']:+.2f}</div></div>
-        </div>
-        <table>
-            <thead>
-                <tr>
-                    <th>Coin</th><th>Prix</th><th>Score</th><th>Signal</th><th>RSI</th><th>MACDh</th><th>ADX</th><th>Vol</th><th>ATR</th><th>Raisons</th>
-                </tr>
-            </thead>
-            <tbody>
-                {rows}
-            </tbody>
-        </table>
-        <div class="footer">
-            Hermes Trading Bot v2 — Donnees CoinGecko — Analyse technique en temps reel
-        </div>
-    </div>
-</body>
-</html>"""
+<html lang="fr"><head>
+<meta charset="UTF-8"><meta name="viewport" content="width=device-width,initial-scale=1.0">
+<title>Hermes Trading Bot v3 — Rapport IA</title>
+<style>
+* {{ margin:0; padding:0; box-sizing:border-box; }}
+body {{ font-family:-apple-system,BlinkMacSystemFont,'Segoe UI',Roboto,sans-serif; background:#0a0e17; color:#e0e0e0; padding:20px; }}
+.container {{ max-width:1400px; margin:0 auto; }}
+h1 {{ color:#00bcd4; font-size:1.4rem; margin-bottom:5px; }}
+.sub {{ color:#888; font-size:0.9rem; margin-bottom:20px; }}
+.stats {{ display:flex; gap:10px; flex-wrap:wrap; margin-bottom:20px; }}
+.card {{ background:#111827; border-radius:8px; padding:12px 15px; flex:1; min-width:100px; }}
+.card h3 {{ font-size:0.7rem; color:#888; text-transform:uppercase; }}
+.card .val {{ font-size:1.3rem; font-weight:700; margin-top:3px; }}
+table {{ width:100%; border-collapse:collapse; font-size:0.8rem; }}
+th {{ background:#111827; padding:8px 6px; text-align:left; color:#888; text-transform:uppercase; position:sticky; top:0; font-size:0.65rem; }}
+td {{ padding:6px; border-bottom:1px solid #1e293b; }}
+tr:hover td {{ background:#111827; }}
+.sig {{ display:inline-block; padding:1px 6px; border-radius:3px; color:#000; font-weight:700; font-size:0.7rem; }}
+.p {{ display:inline-block; background:#1e3a5f; padding:1px 4px; border-radius:2px; font-size:0.65rem; margin:1px; }}
+</style></head><body><div class="container">
+<h1>Hermes Trading Bot v3 &mdash; Analyse IA</h1>
+<div class="sub">{datetime.now().strftime('%d %B %Y %H:%M UTC')}</div>
+<div class="stats">
+<div class="card"><h3>Actifs</h3><div class="val">{sm['total']}</div></div>
+<div class="card" style="border-left:3px solid #00c853;"><h3>Achat</h3><div class="val" style="color:#00c853;">{sm['achat']}</div></div>
+<div class="card" style="border-left:3px solid #ff1744;"><h3>Vente</h3><div class="val" style="color:#ff1744;">{sm['vente']}</div></div>
+<div class="card" style="border-left:3px solid #ffc107;"><h3>Neutre</h3><div class="val" style="color:#ffc107;">{sm['neutre']}</div></div>
+<div class="card"><h3>Best score</h3><div class="val" style="color:#00c853;">{sm['best_score']:+.2f}</div></div>
+<div class="card"><h3>Worst score</h3><div class="val" style="color:#ff1744;">{sm['worst_score']:+.2f}</div></div>
+</div>
+<table><thead><tr>
+<th>Coin</th><th>Prix</th><th>Score</th><th>Signal</th><th>RSI</th><th>MACDh</th><th>ADX</th><th>ML 5j</th><th>Vol</th><th>ATR</th><th>Fib 618</th><th>Diverg</th><th>Analyse</th>
+</tr></thead><tbody>{rows}</tbody></table>
+</div></body></html>"""
 
         html_path = DATA_DIR / f"analyse_{timestamp}.html"
-        with open(html_path, "w") as f:
-            f.write(html)
-        print(f"  📁 Rapport HTML: {html_path}")
-        return html_path
+        with open(html_path, "w") as f: f.write(html)
+        print(f"  Rapport HTML: {html_path}")
 
 
-# ─── Main ────────────────────────────────────────────────────────────
+# ─── Backtest ────────────────────────────────────────────────────
+
+def run_backtest():
+    """Backtest simple de la strategie"""
+    print("\n  Backtesting de la strategie...\n")
+    fetcher = DataFetcher()
+    coins = ["bitcoin", "ethereum", "solana"]
+    all_results = []
+
+    for coin_id in coins:
+        df = fetcher.fetch_market_data(coin_id, days=365)
+        if df.empty or len(df) < 100:
+            continue
+
+        close = df["close"].values
+        total_trades = 0
+        wins = 0
+        losses = 0
+        pnl = []
+
+        for i in range(60, len(close) - 5):
+            # Simule l'analyse a ce point dans le temps
+            chunk = df.iloc[:i]
+            brain = CoinBrain(coin_id, chunk, fetcher)
+            if not brain.compute(): continue
+            brain.signal = brain.generate_signal()
+            result = brain.build_result()
+
+            if result["signal"] == "ACHAT":
+                total_trades += 1
+                entry = close[i]
+                future = close[i+5:i+6]
+                if len(future) > 0:
+                    exit_p = future[0]
+                    ret = (exit_p - entry) / entry * 100
+                    pnl.append(ret)
+                    if ret > 0: wins += 1
+                    else: losses += 1
+
+        if total_trades > 0:
+            win_rate = wins / total_trades * 100
+            avg_pnl = np.mean(pnl) if pnl else 0
+            all_results.append({
+                "coin": coin_id,
+                "trades": total_trades,
+                "win_rate": round(win_rate, 1),
+                "avg_return": round(avg_pnl, 2),
+                "total_return": round(sum(pnl), 2),
+                "sharpe": round(np.mean(pnl) / np.std(pnl) * np.sqrt(52) if np.std(pnl) > 0 else 0, 2),
+            })
+
+    print(f"  Resultats du backtest (periode 1 an):\n")
+    for r in all_results:
+        print(f"  {r['coin']:12s} trades={r['trades']:3d} win_rate={r['win_rate']:5.1f}% "
+              f"avg_ret={r['avg_return']:+.2f}% total={r['total_return']:+.2f}% sharpe={r['sharpe']:+.2f}")
+
+    return all_results
+
+
+# ─── Main ──────────────────────────────────────────────────────────
 
 def main():
-    parser = argparse.ArgumentParser(description="Hermes Trading Bot v2")
-    parser.add_argument("--coin", default="bitcoin,ethereum",
-                        help="Coin(s) (virgules, 'all'=top 20, 'top5'=top 5)")
-    parser.add_argument("--days", type=int, default=60, help="Jours d'historique")
-    parser.add_argument("--save", action="store_true", help="Sauvegarder rapport JSON")
-    parser.add_argument("--html", action="store_true", help="Generer rapport HTML")
-    parser.add_argument("--loop", type=int, help="Boucle toutes les N minutes")
-    parser.add_argument("--quiet", action="store_true", help="Mode silencieux")
+    parser = argparse.ArgumentParser(description="Hermes Trading Bot v3 — IA")
+    parser.add_argument("--coin", default="bitcoin,ethereum", help="Coin(s) ou 'all'")
+    parser.add_argument("--days", type=int, default=90, help="Jours d'historique")
+    parser.add_argument("--save", action="store_true", help="Sauvegarder JSON")
+    parser.add_argument("--html", action="store_true", help="Rapport HTML")
+    parser.add_argument("--llm", action="store_true", help="Analyse IA via Ollama")
+    parser.add_argument("--backtest", action="store_true", help="Backtest strategie")
+    parser.add_argument("--loop", type=int, help="Boucle toutes les N min")
     args = parser.parse_args()
 
-    # Selection des coins
-    if args.coin == "all":
-        coins = TOP_50[:20]
-    elif args.coin == "top5":
-        coins = TOP_50[:5]
-    else:
-        coins = [c.strip() for c in args.coin.split(",")]
+    if args.backtest:
+        run_backtest()
+        return
 
-    analyzer = MarketAnalyzer()
+    coins = TOP_50[:20] if args.coin == "all" else [c.strip() for c in args.coin.split(",")]
+    analyzer = MarketAnalyzer(use_llm=args.llm)
 
     iteration = 0
     while True:
         iteration += 1
-        print(f"\n{'#'*60}")
-        print(f"  # HERMES TRADING BOT v2 — analyse {len(coins)} actifs")
-        print(f"  # Periode: {args.days}j | Iteration #{iteration}")
-        if args.loop:
-            print(f"  # Boucle: toutes les {args.loop} min")
-        print(f"{'#'*60}")
+        print(f"\n{'#'*62}")
+        print(f"# HERMES TRADING BOT v3 — {len(coins)} actifs")
+        print(f"# Periode: {args.days}j | Iteration #{iteration}")
+        if args.llm: print("# Mode IA: actif (qwen2.5:3b)")
+        if args.loop: print(f"# Boucle: {args.loop}min")
+        print(f"{'#'*62}")
 
-        analyzer.analyze_multiple(coins, show_progress=not args.quiet)
-
-        if not args.quiet:
-            analyzer.print_report()
+        analyzer.analyze_multiple(coins)
+        analyzer.print_report()
 
         if args.save or args.html:
             analyzer.save_report(html=args.html)
@@ -925,13 +1155,7 @@ def main():
         if not args.loop:
             break
 
-        # Attente avant prochaine iteration
-        if iteration == 1:
-            wait = args.loop
-        else:
-            wait = args.loop
-        print(f"\n⏳ Prochaine analyse dans {wait} min...")
-        time.sleep(wait * 60)
+        time.sleep(args.loop * 60)
 
 
 if __name__ == "__main__":
